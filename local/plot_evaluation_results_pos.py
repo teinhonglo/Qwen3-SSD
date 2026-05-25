@@ -19,15 +19,15 @@ def extract_stress_binary(stress_pattern: str):
     
     binary_array = []
     clean_words = []
-    is_stressed = False  # 狀態開關
+    is_stressed = False
     punctuation = {",", ".", "?", "!", ";", ":"}
     
     # 2. 逐一掃描 Token
     for token in tokens:
         if token == "<stress>":
-            is_stressed = True   # 開啟重音狀態
+            is_stressed = True
         elif token == "</stress>":
-            is_stressed = False  # 關閉重音狀態
+            is_stressed = False
         elif token in punctuation:
             continue
         else:
