@@ -65,7 +65,7 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
         python finetuning/qwen3_asr_sft.py --seed $seed \
             --train_conf $train_conf \
             --train_file $data_dir/train.jsonl \
-            --eval_file $data_dir/test.jsonl \
+            # --eval_file $data_dir/test.jsonl \
             --output_dir $exp_dir \
             --target "$target" \
             --prompt_file $prompt_file

@@ -10,14 +10,14 @@ download_dir=${data_root}/raw
 extract_root=${data_root}/audio
 audio_dir=${data_root}/audio
 json_root=data-json/TinyStress
-prompt_file=/datas/store162/annhung/Qwen3-SLU/prompt/prompt_s.txt   # 可指定外部 prompt 檔案，空字串則使用 prepare_macslu_jsonl.py 內建 prompt
-target="text_s"
+prompt_file=/datas/store162/annhung/Qwen3-SLU/prompt/prompt_ts.txt   # 可指定外部 prompt 檔案，空字串則使用 prepare_macslu_jsonl.py 內建 prompt
+target="text_ts"
 
 # training config
 nj=4
 gpuid=0
-suffix=_s
-train_conf=conf/TinyStress_qwen3_asr_06b_aug.json
+suffix=_ts
+train_conf=conf/TinyStress_qwen3_asr_06b.json
 seed=66
 
 # stage
@@ -65,7 +65,7 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
         python finetuning/qwen3_asr_sft.py --seed $seed \
             --train_conf $train_conf \
             --train_file $data_dir/train.jsonl \
-            --eval_file $data_dir/test.jsonl \
+            # --eval_file $data_dir/test.jsonl \
             --output_dir $exp_dir \
             --target "$target" \
             --prompt_file $prompt_file
@@ -83,7 +83,7 @@ if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
         mkdir -p ${exp_dir}/${test_set}
 
         CUDA_VISIBLE_DEVICES="$gpuid" \
-            python finetuning/qwen3_asr_test.py \
+            python finetuning/qwen3_asr_test_plot.py \
                 --exp_dir $exp_dir \
                 --auto_latest_checkpoint \
                 --input_jsonl $test_jsonl \
@@ -123,4 +123,14 @@ if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
         echo "========== ${test_set} =========="
         cat "$metrics_file"
     done
+fi
+
+if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
+    # metadata_fn=$exp_dir/best/metadata.json
+    results_dir=${exp_root}/test
+    
+    python local/plot_evaluation_results_pos.py \
+        --pred_file ${exp_root}/${test_sets}/predictions.jsonl \
+        --gt_file ${json_root}/${test_sets}.jsonl \
+        --save_fig_dir $results_dir/imgs
 fi

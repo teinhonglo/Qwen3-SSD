@@ -487,7 +487,7 @@ def main():
         save_steps=save_steps,
         save_total_limit=save_total_limit,
         save_safetensors=True,
-        eval_strategy="steps",
+        eval_strategy="no", #steps
         eval_steps=save_steps,
         do_eval=bool(args_cli.eval_file),
         bf16=use_bf16,

@@ -10,14 +10,14 @@ download_dir=/datas/store162/annhung/WhiStress_ws0202/EmphAssess_Dataset/audio
 extract_root=${data_root}/audio
 audio_dir=${data_root}/audio
 json_root=data-json/Emphassess
-prompt_file=/datas/store162/annhung/Qwen3-SLU/prompt/prompt_gts.txt   # 可指定外部 prompt 檔案，空字串則使用 prepare_macslu_jsonl.py 內建 prompt
-target="text_gts"
+prompt_file=/datas/store162/annhung/Qwen3-SLU/prompt/prompt_s.txt   # 可指定外部 prompt 檔案，空字串則使用 prepare_macslu_jsonl.py 內建 prompt
+target="text_s"
 
 # training config
 nj=4
 gpuid=0
-suffix=_gts
-train_conf=conf/TinyStress_qwen3_asr_06b.json
+suffix=_s
+train_conf=conf/TinyStress_qwen3_asr_06b_aug_15_30.json
 seed=66
 
 # stage

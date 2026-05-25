@@ -66,7 +66,7 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
         python finetuning/qwen3_asr_sft.py --seed $seed \
             --train_conf $train_conf \
             --train_file $data_dir/train.jsonl \
-            --eval_file $data_dir/test.jsonl \
+            # --eval_file $data_dir/test.jsonl \
             --output_dir $exp_dir \
             --target "$target" \
             --prompt_file $prompt_file
@@ -124,4 +124,14 @@ if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
         echo "========== ${test_set} =========="
         cat "$metrics_file"
     done
+fi
+
+if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
+    # metadata_fn=$exp_dir/best/metadata.json
+    results_dir=${exp_root}/${test_set_name}/test
+    
+    python local/plot_evaluation_results_pos.py \
+        --pred_file ${exp_root}/${test_set_name}/${test_sets}/predictions.jsonl \
+        --gt_file ${json_root}/${test_sets}.jsonl \
+        --save_fig_dir $results_dir/imgs
 fi

@@ -125,3 +125,13 @@ if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
         cat "$metrics_file"
     done
 fi
+
+if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
+    # metadata_fn=$exp_dir/best/metadata.json
+    results_dir=${exp_root}/${test_set_name}/test
+    
+    python local/plot_evaluation_results_pos.py \
+        --pred_file ${exp_root}/${test_set_name}/${test_sets}/predictions.jsonl \
+        --gt_file ${json_root}/${test_sets}.jsonl \
+        --save_fig_dir $results_dir/imgs
+fi
