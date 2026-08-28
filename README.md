@@ -1,5 +1,31 @@
 # Qwen3-ASR
 
+## Qwen3-SSD pipeline
+
+The repository includes a unified speech stress detection pipeline. Its
+finetuning, checkpoint, LoRA/QLoRA, and decoding configuration follow
+Qwen3-SLU. Corpus loading and evaluation follow the canonical WhiStress
+adapters for TinyStress, StressTest, StressPresso, Expresso, and EmphAssess.
+
+```bash
+pip install -e ".[ssd]"
+./run.sh --stage 0 --stop_stage 5
+```
+
+The default target is `ts` (transcription plus a JSON stress pattern).
+The auxiliary `gts`, `s`, `gs`, and `tgs` formats remain available:
+
+```bash
+./run.sh --target s --stage 0 --stop_stage 5
+```
+
+Stage 0 downloads and validates all configured corpora, creates a seeded
+90/10 TinyStress train/dev split, and writes the common
+`audio`/`prompt`/`text` JSONL schema. Stage 1 finetunes the model.
+Stages 2-5 run cross-corpus inference, evaluation with explicit coverage,
+error analysis, and plotting. Use `--test_corpora` to select a subset and
+`--train_conf` or `--decoding_conf` to choose another configuration.
+
 <br>
 
 <p align="center">

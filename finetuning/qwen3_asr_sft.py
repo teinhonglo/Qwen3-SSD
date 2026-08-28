@@ -17,6 +17,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -27,29 +29,9 @@ import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
 from transformers import (GenerationConfig, Trainer, TrainerCallback,
-                          TrainingArguments)
-from pathlib import Path
-
-import torchaudio.transforms as T
-
-# DEFAULT_PROMPT = """You are a professional Speech Analysis expert.
-#     Your task is to analyze the provided audio and execute the task:
-   
-#     Transcription & Stress Detection (Stress Pattern): Transcribe the spoken English accurately. If a word is emphasized or stressed by the speaker, explicitly wrap it with <stress> and </stress> tags.
-   
-#     You must strictly follow this output format:
-#     language English<asr_text>[Clean Transcription]<ssd>{"stress_pattern": "[Tagged Transcription]"}
-   
-#     Example Outputs:
-#     - single stress:
-#     language English<asr_text>add seven hours to your two hour timer , right ?<ssd>{"stress_pattern": "add seven <stress> hours </stress> to your two hour timer , right ?"}
-   
-#     - no stress:
-#     language English<asr_text>turn off the living room lights<ssd>{"stress_pattern": "turn off the living room lights"}
-   
-#     - multiple stresses:
-#     language English<asr_text>I said red not blue<ssd>{"stress_pattern": "I said <stress> red </stress> not <stress> blue </stress>"}"""
-
+                          TrainingArguments, BitsAndBytesConfig)
+from peft import LoraConfig, TaskType, get_peft_model
+from peft.peft_model import PeftModel
 
 def patch_outer_forward(model):
     cls = model.__class__
@@ -116,12 +98,9 @@ def build_prefix_messages(prompt: str, audio_array):
     ]
 
 
-def make_preprocess_fn_prefix_only(processor, target, prompt_file):
+def make_preprocess_fn_prefix_only(processor):
     def _preprocess(ex: Dict[str, Any]) -> Dict[str, Any]:
-        # prompt = ex.get("prompt", "")
-        prompt = "" #DEFAULT_PROMPT
-        if prompt_file:
-            prompt = Path(prompt_file).read_text(encoding="utf-8").strip()
+        prompt = ex.get("prompt", "")
         dummy_audio = None
         prefix_msgs = build_prefix_messages(prompt, dummy_audio)
         prefix_text = processor.apply_chat_template(
@@ -130,8 +109,9 @@ def make_preprocess_fn_prefix_only(processor, target, prompt_file):
         return {
             "prompt": prompt,
             "audio": ex["audio"],
-            "target": ex.get(target, ""), #system prompt
-            "prefix_text": prefix_text, #user prompt
+            "target": ex["text"],
+            
+            "prefix_text": prefix_text,
         }
 
     return _preprocess
@@ -179,8 +159,6 @@ class DataCollatorForQwen3ASRFinetuning:
         return full_inputs
 
 
-
-
 def extract_default_prompt(dataset) -> str:
     prompts = []
     for ex in dataset:
@@ -204,34 +182,115 @@ def save_prompt_txt(save_dir: str, prompt: str):
         f.write(prompt or "")
 
 class CastFloatInputsTrainer(Trainer):
+    def __init__(self, *args, spec_aug_config=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spec_aug_config = spec_aug_config or {}
+
+    @staticmethod
+    def _mask_axis(features, axis, max_width, valid_width=None):
+        if max_width <= 0:
+            return features
+        axis_size = features.shape[axis]
+        usable = min(axis_size, valid_width) if valid_width is not None else axis_size
+        if usable <= 1:
+            return features
+        width = int(torch.randint(0, min(max_width, usable) + 1, (1,)).item())
+        if width == 0:
+            return features
+        start = int(torch.randint(0, usable - width + 1, (1,)).item())
+        index = [slice(None)] * features.ndim
+        index[axis] = slice(start, start + width)
+        features[tuple(index)] = 0
+        return features
+
+    def _apply_spec_augment(self, inputs):
+        config = self.spec_aug_config
+        if not self.model.training or not config.get("apply", False):
+            return inputs
+        features = inputs.get("input_features")
+        if not torch.is_tensor(features) or features.ndim != 3:
+            return inputs
+
+        features = features.clone()
+        feature_mask = inputs.get("feature_attention_mask")
+        mask_length = feature_mask.shape[-1] if torch.is_tensor(feature_mask) else None
+        if mask_length == features.shape[1]:
+            time_axis, freq_axis = 1, 2
+        elif mask_length == features.shape[2]:
+            time_axis, freq_axis = 2, 1
+        else:
+            # Qwen processors may expose either [B, T, F] or [B, F, T].
+            # The longer non-batch dimension is treated as time when no mask is available.
+            time_axis, freq_axis = (1, 2) if features.shape[1] >= features.shape[2] else (2, 1)
+
+        for batch_index in range(features.shape[0]):
+            sample = features[batch_index]
+            sample_time_axis = time_axis - 1
+            sample_freq_axis = freq_axis - 1
+            valid_frames = None
+            if torch.is_tensor(feature_mask):
+                valid_frames = int(feature_mask[batch_index].sum().item())
+            self._mask_axis(
+                sample,
+                sample_freq_axis,
+                int(config.get("freq_mask_param", 27)),
+            )
+            self._mask_axis(
+                sample,
+                sample_time_axis,
+                int(config.get("time_mask_param", 50)),
+                valid_width=valid_frames,
+            )
+        inputs["input_features"] = features
+        return inputs
+
     def _prepare_inputs(self, inputs):
         inputs = super()._prepare_inputs(inputs)
         model_dtype = getattr(self.model, "dtype", None)
         if model_dtype is not None:
             for k, v in list(inputs.items()):
                 if torch.is_tensor(v) and v.is_floating_point():
-                    inputs[k] = v.to(dtype=model_dtype)#torch.float32)#
+                    inputs[k] = v.to(dtype=model_dtype)
+        return self._apply_spec_augment(inputs)
 
-        # 🌟 3. SpecAugment (確保只有在訓練模式，且有開啟設定時才執行)
-        spec_aug = getattr(self, "spec_aug_config", None)
-        if self.model.training and spec_aug and spec_aug.get("apply", False):
-            if "input_features" in inputs:
-                # 延遲初始化遮罩器 (只在第一次呼叫時建立)
-                if not hasattr(self, "_freq_mask"):
-                    self._freq_mask = T.FrequencyMasking(freq_mask_param=spec_aug.get("freq_mask_param", 27))
-                    self._time_mask = T.TimeMasking(time_mask_param=spec_aug.get("time_mask_param", 50))
-                
-                # 取得頻譜圖 Tensor (形狀通常是 [Batch, Freq_bins, Time_steps])
-                features = inputs["input_features"]
-                
-                # 隨機打上頻率與時間遮罩
-                features = self._freq_mask(features)
-                features = self._time_mask(features)
-                
-                # 將擴增後的特徵放回字典
-                inputs["input_features"] = features
-            
-        return inputs
+
+def apply_freeze_components(model, freeze_components):
+    if isinstance(freeze_components, str):
+        freeze_components = [freeze_components] if freeze_components.strip() else []
+    if not isinstance(freeze_components, list):
+        raise ValueError("model_args.freeze_components must be a string or list of strings")
+
+    named_modules = dict(model.named_modules())
+    named_parameters = dict(model.named_parameters())
+    frozen = []
+    for requested_name in freeze_components:
+        requested_name = str(requested_name).strip()
+        if not requested_name:
+            continue
+        if requested_name in named_parameters:
+            named_parameters[requested_name].requires_grad = False
+            frozen.append(f"parameter:{requested_name}")
+            continue
+
+        matches = [
+            name for name in named_modules
+            if name == requested_name or name.endswith(f".{requested_name}")
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"freeze component {requested_name!r} matched {matches or 'nothing'}; "
+                "use an unambiguous name from model.named_modules()"
+            )
+        for parameter in named_modules[matches[0]].parameters():
+            parameter.requires_grad = False
+        frozen.append(f"module:{matches[0]}")
+
+    if frozen:
+        print(f"[freeze] {', '.join(frozen)}")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"[params] trainable={trainable:,} / total={total:,} ({100.0 * trainable / total:.2f}%)")
+    return model
 
 class MakeEveryCheckpointInferableCallback(TrainerCallback):
     def __init__(self, processor, model=None, default_prompt: str = ""):
@@ -263,6 +322,37 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         self._save_infer_files(ckpt_dir)
         return control
 
+def save_best_checkpoint(
+    best_src: str,
+    output_dir: str,
+    processor=None,
+    model=None,
+    default_prompt: str = "",
+    best_ckpt_name: str = "checkpoint-best",
+):
+    if not best_src or not os.path.isdir(best_src):
+        print(
+            "[best] checkpoint-best not created: no best_model_checkpoint was selected. "
+            "Please make sure evaluation runs and load_best_model_at_end=true."
+        )
+        return
+
+    best_ckpt_dir = os.path.join(output_dir, best_ckpt_name)
+    if os.path.exists(best_ckpt_dir):
+        shutil.rmtree(best_ckpt_dir)
+    shutil.copytree(best_src, best_ckpt_dir)
+
+    if processor is not None:
+        processor.save_pretrained(best_ckpt_dir)
+        if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+            processor.tokenizer.save_pretrained(best_ckpt_dir)
+
+    if model is not None and getattr(model, "generation_config", None) is not None:
+        model.generation_config.save_pretrained(best_ckpt_dir)
+
+    save_prompt_txt(best_ckpt_dir, default_prompt)
+    print(f"[best] Saved best checkpoint from {best_src} to {best_ckpt_dir}")
+
 
 def parse_args():
     p = argparse.ArgumentParser("Qwen3-ASR Finetuning")
@@ -272,17 +362,20 @@ def parse_args():
                    help="JSON config path with format: [training_args, model_args]")
     p.add_argument('--seed', type=int, default=66)
     p.add_argument("--train_file", type=str, default="train.jsonl")
-    p.add_argument("--eval_file", type=str, default="")
+    p.add_argument("--eval_file", type=str, default="dev.jsonl")
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-finetuning-out")
 
-    # Resume
+    # Resume / warm start
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
-    p.add_argument("--prompt_file", type=str, default="/datas/store162/annhung/Qwen3-SLU/prompt/prompt_ts.txt")
-    p.add_argument("--target", type=str, default="text_ts")
+    p.add_argument(
+        "--init_from_checkpoint",
+        type=str,
+        default="",
+        help="Warm-start model/adapter weights from a checkpoint without resuming optimizer/scheduler state",
+    )
 
     return p.parse_args()
-
 
 def load_train_conf(train_conf_path: str) -> Optional[List[Dict[str, Any]]]:
     if not train_conf_path:
@@ -298,94 +391,6 @@ def load_train_conf(train_conf_path: str) -> Optional[List[Dict[str, Any]]]:
     if not isinstance(training_args, dict) or not isinstance(model_args, dict):
         raise ValueError("train_conf entries must both be dictionaries")
     return [training_args, model_args]
-
-
-def enable_lora(model, model_args_conf: Dict[str, Any]):
-    finetune_type = str(model_args_conf.get("finetune_type", "full")).strip().lower()
-    if finetune_type == "full":
-        return model
-    if finetune_type != "lora":
-        raise ValueError(
-            "model_args.finetune_type must be one of: ['full', 'lora']"
-        )
-
-    try:
-        from peft import LoraConfig, TaskType, get_peft_model
-    except ImportError as e:
-        raise ImportError(
-            "LoRA finetuning requires `peft`. Please install it first, e.g. `pip install peft`."
-        ) from e
-
-    lora_mode = str(model_args_conf.get("lora_mode", "llm_backbone")).strip().lower()
-    if lora_mode not in {"llm_backbone", "audio_encoder_llm_backbone"}:
-        raise ValueError(
-            "model_args.lora_mode must be one of: ['llm_backbone', 'audio_encoder_llm_backbone']"
-        )
-
-    lora_r = int(model_args_conf.get("lora_r", 8))
-    lora_alpha = int(model_args_conf.get("lora_alpha", 16))
-    lora_dropout = float(model_args_conf.get("lora_dropout", 0.05))
-    lora_bias = str(model_args_conf.get("lora_bias", "none"))
-
-    lora_cfg = LoraConfig(
-        task_type=TaskType.FEATURE_EXTRACTION,
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        bias=lora_bias,
-        # target_modules="all-linear",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        modules_to_save=["lm_head"],
-        exclude_modules=["audio_tower"] if lora_mode == "llm_backbone" else None,
-    )
-    lora_cfg.save_embedding_layers = False 
-
-    model = get_peft_model(model, lora_cfg)
-    model.print_trainable_parameters()
-    print("Enable LoRA")
-    return model
-
-
-def apply_freeze_components(model, model_args_conf: Dict[str, Any]):
-    freeze_components = model_args_conf.get("freeze_components", [])
-    if isinstance(freeze_components, str):
-        freeze_components = [freeze_components.strip()] if freeze_components.strip() else []
-    elif not isinstance(freeze_components, list):
-        raise ValueError("model_args.freeze_components must be a string or a list of strings")
-    freeze_components = [str(x).strip() for x in freeze_components if str(x).strip()]
-
-    named_modules = dict(model.named_modules())
-    named_parameters = dict(model.named_parameters())
-
-    frozen_items = []
-    for name in freeze_components:
-        if name in named_modules:
-            for p in named_modules[name].parameters():
-                p.requires_grad = False
-            frozen_items.append(f"module:{name}")
-            continue
-
-        if name in named_parameters:
-            named_parameters[name].requires_grad = False
-            frozen_items.append(f"param:{name}")
-            continue
-
-        available_modules = ", ".join(sorted(k for k in named_modules.keys() if k)[:20])
-        raise ValueError(
-            f"Unknown freeze component: {name}. "
-            "Please provide an exact module name or parameter name from model.named_modules()/model.named_parameters(). "
-            f"Example modules: {available_modules}"
-        )
-
-    if frozen_items:
-        print(f"[freeze] Frozen items: {', '.join(frozen_items)}")
-
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    pct = (100.0 * trainable / total) if total else 0.0
-    print(f"[params] trainable={trainable:,} / total={total:,} ({pct:.2f}%)")
-    return model
-
 
 def main():
     args_cli = parse_args()
@@ -405,6 +410,7 @@ def main():
         raise ValueError("--train_conf is required")
 
     training_args_conf, model_args_conf = train_conf
+    training_args_conf = dict(training_args_conf)
 
     if not args_cli.train_file:
         raise ValueError("TRAIN_FILE is required (json/jsonl). Needs fields: audio, text, optional prompt")
@@ -413,47 +419,89 @@ def main():
     if not model_path:
         raise KeyError("model_args.model_path is required in train_conf")
 
-    sr = int(training_args_conf.get("sr", 16000))
-    batch_size = int(training_args_conf.get("per_device_train_batch_size", 32))
-    grad_acc = int(training_args_conf.get("gradient_accumulation_steps", 4))
-    learning_rate = float(training_args_conf.get("learning_rate", 2e-5))
-    num_train_epochs = float(training_args_conf.get("num_train_epochs", 1))
-    logging_steps = int(training_args_conf.get("logging_steps", 10))
-    lr_scheduler_type = training_args_conf.get("lr_scheduler_type", "linear")
-    warmup_ratio = float(training_args_conf.get("warmup_ratio", 0.02))
-    num_workers = int(training_args_conf.get("dataloader_num_workers", 4))
-    pin_memory = bool(training_args_conf.get("dataloader_pin_memory", True))
-    persistent_workers = bool(training_args_conf.get("dataloader_persistent_workers", True))
-    prefetch_factor = int(training_args_conf.get("dataloader_prefetch_factor", 2))
-    save_strategy = training_args_conf.get("save_strategy", "steps")
-    save_steps = int(training_args_conf.get("save_steps", 200))
-    save_total_limit = int(training_args_conf.get("save_total_limit", 5))
-    spec_aug_config = training_args_conf.get("spec_aug", None)
+    sr = int(model_args_conf.get("sr", 16000))
+    eval_max_new_tokens = int(model_args_conf.get("eval_max_new_tokens", 256))
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
-    asr_wrapper = Qwen3ASRModel.from_pretrained(
-        model_path,
-        # dtype=torch.bfloat16 if use_bf16 else torch.float16,#torch.float32,#
-        # device_map=None,#"auto",#
-    )
+    # LoRA
+    lora_config = model_args_conf.get("lora_config", None)
+    lora_type = model_args_conf.get("lora_type", "default")
+    
+    if lora_type == "qlora":
+        # load pretrained model (reload)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16
+        )
+        asr_wrapper = Qwen3ASRModel.from_pretrained(
+            model_path,
+            dtype=torch.bfloat16 if use_bf16 else torch.float16,
+            quantization_config=bnb_config,
+            device_map=None,
+        )
+    else:
+        # load pretrained model
+        asr_wrapper = Qwen3ASRModel.from_pretrained(
+            model_path,
+            dtype=torch.bfloat16 if use_bf16 else torch.float16,
+            device_map=None,
+        )
+        
     model = asr_wrapper.model
     processor = asr_wrapper.processor
 
-    model = enable_lora(model, model_args_conf)
-    model = apply_freeze_components(model, model_args_conf)
-    # model.gradient_checkpointing_enable()
-
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
+    
+    init_from_checkpoint = (args_cli.init_from_checkpoint or "").strip()
+    if init_from_checkpoint and not os.path.isdir(init_from_checkpoint):
+        raise FileNotFoundError(f"init_from_checkpoint not found: {init_from_checkpoint}")
+
+    if lora_config:
+        if lora_type not in ["default", "qlora"]:
+            raise ValueError(f"lora_type: {lora_type} is NOT implemented yet.")
+
+        print(f"LoRA Finetuning {lora_type}")
+        if init_from_checkpoint:
+            print(f"[init] warm-start LoRA adapter from checkpoint = {init_from_checkpoint}")
+            model = PeftModel.from_pretrained(
+                model,
+                init_from_checkpoint,
+                is_trainable=True,
+            )
+        else:
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                **lora_config
+            )
+            model = get_peft_model(model, peft_config)
+        print("="*100)
+        model.print_trainable_parameters()
+        print("="*100)
+    else:
+        if init_from_checkpoint:
+            raise ValueError("--init_from_checkpoint currently supports LoRA/QLoRA checkpoints only")
+        print("Full Finetuning")
+
+    model = apply_freeze_components(
+        model,
+        model_args_conf.get("freeze_components", []),
+    )
+    
+    if training_args_conf["gradient_checkpointing"]:
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable()
 
     raw_ds = load_dataset(
         "json",
         data_files={
             "train": args_cli.train_file,
-            **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
+            "validation": args_cli.eval_file,
         },
     )
-    ds = raw_ds.map(make_preprocess_fn_prefix_only(processor, args_cli.target, args_cli.prompt_file), num_proc=1)
+    ds = raw_ds.map(make_preprocess_fn_prefix_only(processor), num_proc=1)
 
     keep = {"prompt", "audio", "target", "prefix_text"}
     for split in ds.keys():
@@ -461,47 +509,28 @@ def main():
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
-    # default_prompt = extract_default_prompt(ds["train"], )
-    default_prompt = "" #DEFAULT_PROMPT
-    if args_cli.prompt_file:
-        default_prompt = Path(args_cli.prompt_file).read_text(encoding="utf-8").strip()
-    else:
-        raise ValueError("No prompt")
+    default_prompt = extract_default_prompt(ds["train"])
 
     collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=sr)
 
+    training_args_conf["run_name"] = os.path.basename(args_cli.output_dir)
+    if model_args_conf.get("wandb_project"):
+        os.environ["WANDB_PROJECT"] = model_args_conf["wandb_project"]
+    os.environ["WANDB_LOG_MODEL"] = str(model_args_conf.get("wandb_log_model", "false")).lower()
+
     training_args = TrainingArguments(
         output_dir=args_cli.output_dir,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=grad_acc,
-        learning_rate=learning_rate,
-        num_train_epochs=num_train_epochs,
-        logging_steps=logging_steps,
-        lr_scheduler_type=lr_scheduler_type,
-        warmup_ratio=warmup_ratio,
-        dataloader_num_workers=num_workers,
-        dataloader_pin_memory=pin_memory,
-        dataloader_persistent_workers=persistent_workers,
-        dataloader_prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        save_strategy=save_strategy,
-        save_steps=save_steps,
-        save_total_limit=save_total_limit,
-        save_safetensors=True,
-        eval_strategy="no", #steps
-        eval_steps=save_steps,
-        do_eval=bool(args_cli.eval_file),
+        do_eval=True,
         bf16=use_bf16,
         fp16=not use_bf16,
-        ddp_find_unused_parameters=False,
-        remove_unused_columns=False,
-        report_to="none",
+        **training_args_conf
     )
 
     trainer = CastFloatInputsTrainer(
         model=model,
         args=training_args,
         train_dataset=ds["train"],
-        eval_dataset=ds.get("validation", None),
+        eval_dataset=ds["validation"],
         data_collator=collator,
         tokenizer=processor.tokenizer,
         callbacks=[
@@ -509,10 +538,10 @@ def main():
                 processor=processor,
                 model=model,
                 default_prompt=default_prompt,
-            )
+            ),
         ],
+        spec_aug_config=model_args_conf.get("spec_aug", {}),
     )
-    trainer.spec_aug_config = spec_aug_config
 
     os.makedirs(training_args.output_dir, exist_ok=True)
 
@@ -529,10 +558,9 @@ def main():
     if getattr(model, "generation_config", None) is not None:
         model.generation_config.save_pretrained(training_args.output_dir)
 
-    if trainer.args.process_index == 0:
-        save_prompt_txt(training_args.output_dir, default_prompt)
-
     resume_from = (args_cli.resume_from or "").strip()
+    if init_from_checkpoint and (resume_from or args_cli.resume == 1):
+        raise ValueError("--init_from_checkpoint warm-starts weights and cannot be combined with --resume/--resume_from")
     if not resume_from and args_cli.resume == 1:
         resume_from = find_latest_checkpoint(training_args.output_dir) or ""
 
@@ -542,6 +570,16 @@ def main():
         trainer.train(resume_from_checkpoint=resume_from)
     else:
         trainer.train()
+
+    if trainer.args.process_index == 0:
+        save_best_checkpoint(
+            best_src=getattr(trainer.state, "best_model_checkpoint", None),
+            output_dir=training_args.output_dir,
+            processor=processor,
+            model=model,
+            default_prompt=default_prompt,
+        )
+        save_prompt_txt(training_args.output_dir, default_prompt)
 
 
 if __name__ == "__main__":

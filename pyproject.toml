@@ -37,6 +37,16 @@ dependencies = [
 vllm = [
   "vllm==0.14.0",
 ]
+ssd = [
+  "bitsandbytes",
+  "datasets",
+  "matplotlib",
+  "pandas",
+  "peft",
+  "pyphen",
+  "seaborn",
+  "wandb",
+]
 
 [project.urls]
 Homepage = "https://github.com/Qwen/Qwen3-ASR"
