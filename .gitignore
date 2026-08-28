@@ -26,3 +26,6 @@ data*
 exp
 .gradio
 *.png
+*.log
+log.txt
+dump
