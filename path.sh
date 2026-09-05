@@ -1,6 +1,6 @@
 export PYTHONNOUSERSITE=1
-export WANDB_DISABLED=true
-export WANDB_MODE=offline
+# Keep experiment tracking available while defaulting to a network-free run.
+export WANDB_MODE=${WANDB_MODE:-offline}
 #export PYTHONPATH="."
 
 eval "$(conda shell.bash hook)"

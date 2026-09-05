@@ -1,54 +1,48 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import argparse
+import json
 import os
 import re
-import json
-import argparse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import librosa
 import torch
+from peft import PeftModel
 from qwen_asr import Qwen3ASRModel
-from pathlib import Path
 
 
 _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
+_TARGET_FORMATS = ("ts", "gts", "s", "gs", "tgs")
 
-# DEFAULT_PROMPT = """You are a professional Speech Analysis expert.
-#     Your task is to analyze the provided audio and execute the task:
-   
-#     Transcription & Stress Detection (Stress Pattern): Transcribe the spoken English accurately. If a word is emphasized or stressed by the speaker, explicitly wrap it with <stress> and </stress> tags.
-   
-#     You must strictly follow this output format:
-#     language English<asr_text>[Clean Transcription]<ssd>{"gender": "[Gender]", "stress_pattern": "[Tagged Transcription]"}
-   
-#     Example Outputs:
-#     - single stress:
-#     language English<asr_text>add seven hours to your two hour timer , right ?<ssd>{"stress_pattern": "add seven <stress> hours </stress> to your two hour timer , right ?"}
-   
-#     - no stress:
-#     language English<asr_text>turn off the living room lights<ssd>{"stress_pattern": "turn off the living room lights"}
-   
-#     - multiple stresses:
-#     language English<asr_text>I said red not blue<ssd>{"stress_pattern": "I said <stress> red </stress> not <stress> blue </stress>"}"""
 
 def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     if not output_dir or not os.path.isdir(output_dir):
         return None
-
-    best_step = None
-    best_path = None
+    candidates = []
     for name in os.listdir(output_dir):
-        m = _CKPT_RE.match(name)
-        if not m:
-            continue
-        step = int(m.group(1))
+        match = _CKPT_RE.match(name)
         path = os.path.join(output_dir, name)
-        if os.path.isdir(path) and (best_step is None or step > best_step):
-            best_step = step
-            best_path = path
-    return best_path
+        if match and os.path.isdir(path):
+            candidates.append((int(match.group(1)), path))
+    return max(candidates)[1] if candidates else None
+
+
+def resolve_checkpoint(exp_dir: str, use_best: bool, use_latest: bool) -> str:
+    if use_best and use_latest:
+        raise ValueError("--auto_best_checkpoint and --auto_latest_checkpoint are mutually exclusive")
+    if use_best:
+        checkpoint = os.path.join(exp_dir, "checkpoint-best")
+        if not os.path.isdir(checkpoint):
+            raise FileNotFoundError(f"Best checkpoint not found: {checkpoint}")
+        return checkpoint
+    if use_latest:
+        checkpoint = find_latest_checkpoint(exp_dir)
+        if checkpoint is None:
+            raise FileNotFoundError(f"No checkpoint-* directory found under: {exp_dir}")
+        return checkpoint
+    return exp_dir
 
 
 def load_audio(path: str, sr: int = 16000):
@@ -64,430 +58,396 @@ def build_prefix_messages(prompt: str, audio_array=None):
 
 
 def build_prefix_text(processor, prompt: str) -> str:
-    prefix_msgs = build_prefix_messages(prompt, None)
     prefix_text = processor.apply_chat_template(
-        [prefix_msgs],
+        [build_prefix_messages(prompt, None)],
         add_generation_prompt=True,
         tokenize=False,
     )
-    if isinstance(prefix_text, list):
-        prefix_text = prefix_text[0]
-    return prefix_text
+    return prefix_text[0] if isinstance(prefix_text, list) else prefix_text
 
 
-def move_inputs_to_device(inputs: Dict[str, Any], device: str, model_dtype: torch.dtype):
-    new_inputs = {}
-    for k, v in inputs.items():
-        if torch.is_tensor(v):
-            v = v.to(device)
-            if v.is_floating_point():
-                v = v.to(model_dtype)
-        new_inputs[k] = v
-    return new_inputs
+def move_inputs_to_device(inputs: Dict[str, Any], device, model_dtype):
+    moved = {}
+    for key, value in inputs.items():
+        if torch.is_tensor(value):
+            value = value.to(device)
+            if value.is_floating_point():
+                value = value.to(model_dtype)
+        moved[key] = value
+    return moved
 
 
 def batch_decode_text(processor, token_ids):
-    if hasattr(processor, "batch_decode"):
-        return processor.batch_decode(
-            token_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-    return processor.tokenizer.batch_decode(
+    decoder = processor.batch_decode if hasattr(processor, "batch_decode") else processor.tokenizer.batch_decode
+    return decoder(
         token_ids,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )
 
 
-def unwrap_generate_output(gen_out):
-    if hasattr(gen_out, "sequences"):
-        return gen_out.sequences
-    if isinstance(gen_out, dict) and "sequences" in gen_out:
-        return gen_out["sequences"]
-    if isinstance(gen_out, (tuple, list)):
-        return gen_out[0]
-    return gen_out
-
-
-def _extract_first_json_dict(text: str) -> str:
-    text = (text or "").strip()
-    if not text:
-        return {}
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:].strip()
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    return m.group(0) if m else text
-
-
-# def try_parse_tasks_list(text: str) -> List[Dict[str, Any]]:
-#     payload = _extract_first_json_array(text)
-#     try:
-#         obj = json.loads(payload)
-#         if isinstance(obj, list):
-#             return obj
-#     except Exception:
-#         pass
-#     return []
-
-def try_parse_tasks_dict(text: str) -> Dict[str, Any]:
-    payload = _extract_first_json_dict(text)
-    try:
-        obj = json.loads(payload)
-        # 🌟 修正：確保解析出來的是 dict 而不是 list
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    return {}
+def unwrap_generate_output(generate_output):
+    if hasattr(generate_output, "sequences"):
+        return generate_output.sequences
+    if isinstance(generate_output, dict) and "sequences" in generate_output:
+        return generate_output["sequences"]
+    if isinstance(generate_output, (tuple, list)):
+        return generate_output[0]
+    return generate_output
 
 
 def infer_one(
     asr_wrapper,
     audio_path: str,
-    prompt: str = "",
-    sr: int = 16000,
-    max_new_tokens: int = 256,
-    do_sample: bool = False,
-    temperature: float = 1.0,
-    top_p: float = 1.0,
-) -> str:
+    prompt: str,
+    sr: int,
+    generation: Dict[str, Any],
+    decoding_mode: str,
+    dola_conf: Optional[Dict[str, Any]] = None,
+) -> Union[str, List[str]]:
     processor = asr_wrapper.processor
     model = asr_wrapper.model
     device = next(model.parameters()).device
     model_dtype = getattr(model, "dtype", torch.float16)
 
-    wav = load_audio(audio_path, sr=sr)
-    prefix_text = build_prefix_text(processor, prompt)
-
     inputs = processor(
-        text=[prefix_text],
-        audio=[wav],
+        text=[build_prefix_text(processor, prompt)],
+        audio=[load_audio(audio_path, sr=sr)],
         return_tensors="pt",
         padding=True,
         truncation=False,
     )
-
     prefix_len = int(inputs["attention_mask"][0].sum().item())
-    inputs = move_inputs_to_device(inputs, device=device, model_dtype=model_dtype)
+    inputs = move_inputs_to_device(inputs, device, model_dtype)
 
-    gen_kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": do_sample,
+    num_return_sequences = int(generation["num_return_sequences"])
+    beam_size = max(int(generation["beam_size"]), num_return_sequences)
+    generate_kwargs = {
+        "max_new_tokens": int(generation["max_new_tokens"]),
+        "do_sample": bool(generation["do_sample"]),
+        "repetition_penalty": float(generation["repetition_penalty"]),
+        "num_return_sequences": num_return_sequences,
     }
-    if do_sample:
-        gen_kwargs["temperature"] = temperature
-        gen_kwargs["top_p"] = top_p
+    if generate_kwargs["do_sample"]:
+        generate_kwargs.update(
+            temperature=float(generation["temperature"]),
+            top_p=float(generation["top_p"]),
+        )
+        if int(generation["top_k"]) > 0:
+            generate_kwargs["top_k"] = int(generation["top_k"])
+    if beam_size > 1:
+        generate_kwargs["num_beams"] = beam_size
 
+    if decoding_mode == "dola":
+        dola_conf = dola_conf or {}
+        generate_kwargs["dola_layers"] = dola_conf.get("layers", "high")
+        generate_kwargs["repetition_penalty"] = float(
+            dola_conf.get("repetition_penalty", generate_kwargs["repetition_penalty"])
+        )
+    elif decoding_mode not in {"basic", "layer_lmhead"}:
+        raise ValueError(f"Unsupported decoding mode: {decoding_mode}")
+
+    model.eval()
     with torch.inference_mode():
-        gen_out = model.generate(**inputs, **gen_kwargs)
-
-    output_ids = unwrap_generate_output(gen_out)
-
+        output_ids = unwrap_generate_output(model.generate(**inputs, **generate_kwargs))
     if not torch.is_tensor(output_ids):
         raise TypeError(f"generate() returned unsupported type: {type(output_ids)}")
-
-    if output_ids.dim() == 1:
+    if output_ids.ndim == 1:
         output_ids = output_ids.unsqueeze(0)
+    generated_ids = output_ids[:, prefix_len:] if output_ids.shape[1] > prefix_len else output_ids
+    decoded = [text.strip() for text in batch_decode_text(processor, generated_ids)]
+    return decoded if num_return_sequences > 1 else (decoded[0] if decoded else "")
 
-    if output_ids.size(1) > prefix_len:
-        gen_only_ids = output_ids[:, prefix_len:]
-    else:
-        gen_only_ids = output_ids
 
-    decoded = batch_decode_text(processor, gen_only_ids)[0].strip()
-    return decoded
+def extract_first_json_dict(text: str) -> Dict[str, Any]:
+    text = (text or "").strip()
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    if start < 0:
+        return {}
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = json.loads(text[start:index + 1])
+                    return value if isinstance(value, dict) else {}
+                except json.JSONDecodeError:
+                    return {}
+    return {}
+
+
+def remove_stress_tags(text: str) -> str:
+    return " ".join(
+        (text or "").replace("<stress>", " ").replace("</stress>", " ").split()
+    )
+
+
+def strip_asr_prefix(text: str) -> str:
+    text = re.sub(r"^language\s+[^<\s]+", "", (text or "").strip(), flags=re.IGNORECASE)
+    if "<asr_text>" in text:
+        text = text.split("<asr_text>", 1)[1]
+    return text.strip()
+
+
+def parse_ssd_output(raw_text: str, target_format: str) -> Dict[str, Any]:
+    result = {
+        "pred_transcription": "",
+        "pred_stress": "",
+        "pred_gender": "",
+        "parse_error": "",
+    }
+    if target_format not in _TARGET_FORMATS:
+        result["parse_error"] = f"unsupported target format: {target_format}"
+        return result
+    if "<ssd>" not in raw_text:
+        result["parse_error"] = "missing <ssd> separator"
+        return result
+
+    prefix, payload = raw_text.split("<ssd>", 1)
+    prefix = strip_asr_prefix(prefix)
+    payload = payload.strip()
+
+    if target_format in {"ts", "gts"}:
+        parsed = extract_first_json_dict(payload)
+        result["pred_stress"] = str(parsed.get("stress_pattern", "") or "").strip()
+        result["pred_gender"] = str(parsed.get("gender", "") or "").strip()
+        result["pred_transcription"] = prefix
+        if not parsed:
+            result["parse_error"] = "invalid SSD JSON payload"
+    elif target_format == "s":
+        result["pred_stress"] = payload
+        result["pred_transcription"] = remove_stress_tags(payload)
+    elif target_format == "gs":
+        if "<gender>" in prefix:
+            _, result["pred_gender"] = prefix.split("<gender>", 1)
+        result["pred_gender"] = result["pred_gender"].strip()
+        result["pred_stress"] = payload
+        result["pred_transcription"] = remove_stress_tags(payload)
+    elif target_format == "tgs":
+        if "<gender>" in prefix:
+            transcription, gender = prefix.split("<gender>", 1)
+            result["pred_transcription"] = transcription.strip()
+            result["pred_gender"] = gender.strip()
+        else:
+            result["pred_transcription"] = prefix
+            result["parse_error"] = "missing <gender> separator"
+        result["pred_stress"] = payload
+
+    if not result["pred_stress"] and not result["parse_error"]:
+        result["parse_error"] = "empty stress prediction"
+    if not result["pred_transcription"] and result["pred_stress"]:
+        result["pred_transcription"] = remove_stress_tags(result["pred_stress"])
+    return result
 
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    data = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line_id, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
+    rows = []
+    with open(path, "r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
                 continue
             try:
-                data.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON at line {line_id} in {path}: {e}")
-    return data
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid JSON at line {line_number} in {path}: {error}") from error
+    return rows
 
 
-def resolve_dtype(dtype_str: str, device: str) -> torch.dtype:
-    if dtype_str == "bfloat16":
-        return torch.bfloat16
-    if dtype_str == "float16":
-        return torch.float16
-    if dtype_str == "float32":
-        return torch.float32
+def load_train_conf(exp_dir: str):
+    path = os.path.join(exp_dir, "train_conf.json")
+    with open(path, "r", encoding="utf-8") as file:
+        config = json.load(file)
+    if not isinstance(config, list) or len(config) != 2 or not all(isinstance(x, dict) for x in config):
+        raise ValueError("train_conf.json must contain [training_args, model_args]")
+    return config
 
+
+def load_decoding_conf(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as file:
+        config = json.load(file)
+    if not isinstance(config, dict):
+        raise ValueError("decoding config must be a JSON object")
+    return config
+
+
+def resolve_decoding_conf(model_args: Dict[str, Any], decoding_conf: Dict[str, Any]):
+    decoding = decoding_conf.get("decoding", {})
+    generation = decoding.get("generation", {})
+    num_return_sequences = int(generation.get("num_return_sequences", model_args.get("num_return_sequences", 1)))
+    beam_size = int(generation.get("beam_size", generation.get("num_beams", model_args.get("beam_size", 1))))
+    return {
+        "mode": str(decoding.get("mode", "basic")),
+        "strict": bool(decoding.get("strict", False)),
+        "generation": {
+            "max_new_tokens": int(generation.get("max_new_tokens", model_args.get("max_new_tokens", 256))),
+            "do_sample": bool(generation.get("do_sample", model_args.get("do_sample", False))),
+            "temperature": float(generation.get("temperature", model_args.get("temperature", 0.0))),
+            "top_p": float(generation.get("top_p", model_args.get("top_p", 1.0))),
+            "top_k": int(generation.get("top_k", 0)),
+            "repetition_penalty": float(generation.get("repetition_penalty", 1.0)),
+            "num_return_sequences": max(1, num_return_sequences),
+            "beam_size": max(1, beam_size, num_return_sequences),
+        },
+        "dola": decoding.get("dola", {}),
+        "layer_lmhead": decoding.get("layer_lmhead", {}),
+    }
+
+
+def resolve_dtype(dtype_string: str, device: str):
+    explicit = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    if dtype_string in explicit:
+        return explicit[dtype_string]
     if device.startswith("cuda") and torch.cuda.is_available():
-        try:
-            major = torch.cuda.get_device_capability(device=device)[0]
-        except Exception:
-            major = torch.cuda.get_device_capability()[0]
-        if major >= 8:
-            return torch.bfloat16
-        return torch.float16
+        return torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     return torch.float32
 
 
-def get_jsonl_name(input_jsonl: str) -> str:
-    base = os.path.basename(input_jsonl)
-    name, _ = os.path.splitext(base)
-    return name
+def build_model(model_args, checkpoint_path, device, dtype, resolved_decoding):
+    lora_config = model_args.get("lora_config")
+    if lora_config:
+        wrapper = Qwen3ASRModel.from_pretrained(
+            model_args["model_path"],
+            dtype=dtype,
+            device_map=device,
+        )
+        wrapper.model = PeftModel.from_pretrained(
+            wrapper.model,
+            checkpoint_path,
+            torch_dtype=dtype,
+        )
+    else:
+        wrapper = Qwen3ASRModel.from_pretrained(
+            checkpoint_path,
+            dtype=dtype,
+            device_map=device,
+        )
+    if resolved_decoding["mode"] == "layer_lmhead":
+        setter = getattr(wrapper.model, "set_layer_lmhead_index", None)
+        if setter is None:
+            raise AttributeError("The model does not support layer_lmhead decoding")
+        setter(int(resolved_decoding["layer_lmhead"].get("layer_index", -1)))
+    return wrapper
 
 
-def write_ssd_prediction_jsonl(rows_out: List[Dict[str, Any]], output_root: str, jsonl_name: str):
-    save_dir = os.path.join(output_root, jsonl_name)
-    os.makedirs(save_dir, exist_ok=True)
-    out_path = os.path.join(save_dir, "predictions.jsonl")
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        for row in rows_out:
-            item = {
-                "id": row["text_id"],
-                "pred_gender": row.get("pred_gender", ""),
-                "pred_transcription": row.get("pred_transcription", ""),
-                "pred_transcription_0": row.get("pred_transcription_0", ""),
-                "pred_stress": row.get("pred_stress", ""),
-            }
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-
-    print(f"[info] saved: {out_path}")
+def output_subdir(input_jsonl: str, decoding_conf_path: str) -> str:
+    data_name = os.path.splitext(os.path.basename(input_jsonl))[0]
+    decoding_name = os.path.splitext(os.path.basename(decoding_conf_path))[0]
+    return f"{data_name}_{decoding_name}"
 
 
 def parse_args():
-    p = argparse.ArgumentParser("Qwen3-ASR SLU test script")
-
-    p.add_argument("--exp_dir", type=str, required=True,
-                   help="Experiment directory. Will load train_conf.json from this directory")
-    p.add_argument("--auto_latest_checkpoint", action="store_true",
-                   help="If exp_dir contains checkpoints, automatically use latest checkpoint")
-
-    p.add_argument("--input_jsonl", type=str, required=True,
-                   help="Input JSONL with fields like text_id, query, audio, prompt")
-
-    p.add_argument("--output_root", type=str, default="checkpoints",
-                   help='Root output dir. Default: "checkpoints"')
-
-    p.add_argument("--device", type=str, default="cuda:0",
-                   help='e.g. "cuda:0", "cuda:1", "cpu"')
-    p.add_argument("--prompt_file", default="/datas/store162/annhung/Qwen3-SLU/prompt/prompt_ts.txt")
-    p.add_argument("--target", default="text_ts")
-    return p.parse_args()
-
-
-def load_train_conf_from_exp_dir(exp_dir: str) -> Optional[List[Dict[str, Any]]]:
-    if not exp_dir:
-        return None
-
-    train_conf_path = os.path.join(exp_dir, "train_conf.json")
-    if not os.path.isfile(train_conf_path):
-        raise FileNotFoundError(f"train_conf.json not found under exp_dir: {train_conf_path}")
-
-    with open(train_conf_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    if not isinstance(cfg, list) or len(cfg) != 2:
-        raise ValueError("train_conf.json must be [training_args, model_args]")
-    if not isinstance(cfg[0], dict) or not isinstance(cfg[1], dict):
-        raise ValueError("Both train_conf entries must be dictionaries")
-    return cfg
+    parser = argparse.ArgumentParser("Qwen3-ASR SSD inference")
+    parser.add_argument("--exp_dir", required=True)
+    parser.add_argument("--auto_latest_checkpoint", action="store_true")
+    parser.add_argument("--auto_best_checkpoint", action="store_true")
+    parser.add_argument("--input_jsonl", required=True)
+    parser.add_argument("--output_root", default="checkpoints")
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--decoding_conf", default="conf/decoding/basic_decoding.json")
+    parser.add_argument("--target", choices=_TARGET_FORMATS, default=None)
+    parser.add_argument("--num_return_sequences", type=int, default=None)
+    parser.add_argument("--beam_size", type=int, default=None)
+    return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
-    prompt = "" #DEFAULT_PROMPT
-    if args.prompt_file:
-        prompt = Path(args.prompt_file).read_text(encoding="utf-8").strip()
-    else:
-        raise ValueError("No prompt")
-
-    if args.target:
-        target = args.target
-    else:
-        raise ValueError("No prompt")
-
-    train_conf = load_train_conf_from_exp_dir(args.exp_dir)
-    if train_conf is None:
-        raise ValueError("Unable to load train_conf from exp_dir")
-
-    training_args_conf, model_args_conf = train_conf
-    sr = int(training_args_conf.get("sr", 16000))
-    max_new_tokens = int(training_args_conf.get("max_new_tokens", 256))
-    do_sample = bool(training_args_conf.get("do_sample", False))
-    temperature = float(training_args_conf.get("temperature", 1.0))
-    top_p = float(training_args_conf.get("top_p", 1.0))
-    dtype_str = str(model_args_conf.get("dtype", "auto"))
-
-    model_path = args.exp_dir
-    if args.auto_latest_checkpoint:
-        latest_ckpt = find_latest_checkpoint(model_path)
-        if latest_ckpt is None:
-            raise ValueError(f"No checkpoint-* found under: {model_path}")
-        model_path = latest_ckpt
-        print(f"[info] use latest checkpoint: {model_path}")
-
-    dtype = resolve_dtype(dtype_str, args.device)
-    jsonl_name = get_jsonl_name(args.input_jsonl)
-
-    asr_wrapper = Qwen3ASRModel.from_pretrained(
-        model_path,
-        dtype=dtype,
-        device_map=args.device,
+    _, model_args = load_train_conf(args.exp_dir)
+    resolved_decoding = resolve_decoding_conf(model_args, load_decoding_conf(args.decoding_conf))
+    if args.num_return_sequences is not None:
+        resolved_decoding["generation"]["num_return_sequences"] = max(1, args.num_return_sequences)
+    if args.beam_size is not None:
+        resolved_decoding["generation"]["beam_size"] = max(1, args.beam_size)
+    resolved_decoding["generation"]["beam_size"] = max(
+        resolved_decoding["generation"]["beam_size"],
+        resolved_decoding["generation"]["num_return_sequences"],
     )
 
+    checkpoint_path = resolve_checkpoint(
+        args.exp_dir,
+        args.auto_best_checkpoint,
+        args.auto_latest_checkpoint,
+    )
+    print(f"[info] use checkpoint: {checkpoint_path}")
+    dtype = resolve_dtype(str(model_args.get("dtype", "auto")), args.device)
+    wrapper = build_model(model_args, checkpoint_path, args.device, dtype, resolved_decoding)
+
+    save_dir = os.path.join(args.output_root, output_subdir(args.input_jsonl, args.decoding_conf))
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, "resolved_decoding_config.json"), "w", encoding="utf-8") as file:
+        json.dump(resolved_decoding, file, ensure_ascii=False, indent=2)
+
+    output_rows = []
     rows = load_jsonl(args.input_jsonl)
-    rows_out = []
-
-    for i, row in enumerate(rows, start=1):
-        text_id = str(row.get("text_id", f"line{i}")).strip()
+    for index, row in enumerate(rows, start=1):
+        text_id = str(row.get("text_id", row.get("id", f"line{index}")))
+        target_format = args.target or row.get("target_format", "ts")
+        prediction = {
+            "id": text_id,
+            "text_id": text_id,
+            "source_dataset": row.get("source_dataset", ""),
+            "transcription": row.get("transcription", ""),
+            "emphasis_indices": row.get("emphasis_indices", []),
+            "pred_raw": "",
+            "pred_transcription": "",
+            "pred_stress": "",
+            "pred_gender": "",
+            "parse_error": "",
+        }
         audio_path = row.get("audio", "")
-        # prompt = row.get("prompt", "")
-        # print(prompt)
-        transcription = row.get("transcription", "")
-
-        if not audio_path:
-            print(f"[skip] line {i}: no audio field")
+        if not audio_path or not os.path.isfile(audio_path):
+            prediction["parse_error"] = f"missing audio: {audio_path}"
+            output_rows.append(prediction)
             continue
+        try:
+            generated = infer_one(
+                wrapper,
+                audio_path=audio_path,
+                prompt=str(row.get("prompt", "") or ""),
+                sr=int(model_args.get("sr", 16000)),
+                generation=resolved_decoding["generation"],
+                decoding_mode=resolved_decoding["mode"],
+                dola_conf=resolved_decoding["dola"],
+            )
+            nbest = generated if isinstance(generated, list) else [generated]
+            prediction["pred_raw"] = nbest[0] if nbest else ""
+            prediction["nbest"] = nbest
+            prediction.update(parse_ssd_output(prediction["pred_raw"], target_format))
+        except Exception as error:
+            prediction["parse_error"] = f"{type(error).__name__}: {error}"
+        output_rows.append(prediction)
+        print(f"[{index}/{len(rows)}] {text_id}: {prediction['parse_error'] or 'ok'}")
 
-        pred_raw = infer_one(
-            asr_wrapper=asr_wrapper,
-            audio_path=audio_path,
-            prompt=prompt,
-            sr=sr,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-        )
-        if target == "text_ts":
-            if "<ssd>" in pred_raw:
-                pred_transcription_raw = pred_raw.split("<ssd>")[0]
-                pred_raw_text = pred_raw.split("<ssd>")[1]
-                pred_transcription = pred_transcription_raw.replace("language English", "").replace("<asr_text>", "").strip()
-                pred_raw_dict = try_parse_tasks_dict(pred_raw_text)
-                pred_stress = pred_raw_dict.get("stress_pattern", "")
-
-                pred_transcription_0 = pred_stress.replace("<stress>", "").replace("</stress>", "").strip()
-                pred_transcription_0 = " ".join(pred_transcription_0.split())
-
-                
-            else:
-                pred_transcription = ""
-
-            print(f"pred_<ssd>{pred_raw_text}")
-            rows_out.append({
-                "text_id": text_id,
-                "pred_transcription_0": pred_transcription_0,
-                "pred_transcription": pred_transcription,
-                "pred_stress": pred_stress
-            })
-
-        if target == "text_gts":
-            if "<ssd>" in pred_raw:
-                pred_transcription_raw = pred_raw.split("<ssd>")[0]
-                pred_raw_text = pred_raw.split("<ssd>")[1]
-                pred_transcription = pred_transcription_raw.replace("language English", "").replace("<asr_text>", "").strip()
-                pred_raw_dict = try_parse_tasks_dict(pred_raw_text)
-                pred_stress = pred_raw_dict.get("stress_pattern", "")
-                pred_gender = pred_raw_dict.get("gender", "")
-
-                pred_transcription_0 = pred_stress.replace("<stress>", "").replace("</stress>", "").strip()
-                pred_transcription_0 = " ".join(pred_transcription_0.split())
-
-            else:
-                pred_transcription = ""
-
-            print(f"pred_<ssd>{pred_raw_text}")
-            rows_out.append({
-                "text_id": text_id,
-                "pred_transcription_0": pred_transcription_0,
-                "pred_transcription": pred_transcription,
-                "pred_stress": pred_stress,
-                "pred_gender": pred_gender
-            })
-        
-        if target == "text_s":
-            if "<ssd>" in pred_raw:
-                pred_stress = pred_raw.split("<ssd>")[1]
-                pred_transcription = pred_stress.replace("<stress>", "").replace("</stress>", "").strip()
-                pred_transcription = " ".join(pred_transcription.split())
-            else:
-                pred_stress = ""
-
-            print(f"transcript:{pred_transcription}\nstress:{pred_stress}")
-            rows_out.append({
-                "text_id": text_id,
-                "pred_transcription": pred_transcription,
-                "pred_stress": pred_stress,
-            })
-
-        if target == "text_gs":
-            if "<ssd>" in pred_raw:
-                print(pred_raw)
-                pred_gender_raw = pred_raw.split("<ssd>")[0]
-                pred_stress = pred_raw.split("<ssd>")[1]
-                pred_transcription = pred_stress.replace("<stress>", "").replace("</stress>", "").strip()
-                pred_transcription = " ".join(pred_transcription.split())
-                if "<gender>" in pred_gender_raw:
-                    pred_gender = pred_gender_raw.split("<gender>")[1]
-                    print(pred_gender)
-                else:
-                    pred_gender = ""
-            else:
-                pred_stress = ""
-
-            print(f"pred: <gender>{pred_gender}<ssd>{pred_stress}")
-            rows_out.append({
-                "text_id": text_id,
-                "pred_gender": pred_gender,
-                "pred_transcription": pred_transcription,
-                "pred_stress": pred_stress,
-            })
-        
-        if target == "text_tgs":
-            if "<ssd>" in pred_raw:
-                print(pred_raw)
-                pred_gender_raw = pred_raw.split("<ssd>")[0]
-                pred_stress = pred_raw.split("<ssd>")[1]
-                pred_transcription_0 = pred_stress.replace("<stress>", "").replace("</stress>", "").strip()
-                pred_transcription_0 = " ".join(pred_transcription_0.split())
-                if "<gender>" in pred_gender_raw:
-                    pred_transcription_raw = pred_gender_raw.split("<gender>")[0]
-                    pred_gender = pred_gender_raw.split("<gender>")[1]
-                    print(pred_gender)
-                    if "<asr_text>" in pred_transcription_raw:
-                        pred_transcription = pred_transcription_raw.split("<asr_text>")[1]
-                        print(pred_gender)
-                    else:
-                        pred_transcription = ""
-                else:
-                    pred_gender = ""
-                    if "<asr_text>" in pred_gender_raw:
-                        pred_transcription = pred_gender_raw.split("<asr_text>")[1]
-                        print(pred_gender)
-                    else:
-                        pred_transcription = ""
-            else:
-                pred_stress = ""
-
-            print(f"pred: <transcription>{pred_transcription}<gender>{pred_gender}<ssd>{pred_stress}")
-            rows_out.append({
-                "text_id": text_id,
-                "pred_gender": pred_gender,
-                "pred_transcription_0": pred_transcription_0,
-                "pred_transcription": pred_transcription,
-                "pred_stress": pred_stress,
-            })
-
-        print(f"[{i}/{len(rows)}] done: {text_id}")
-
-    write_ssd_prediction_jsonl(rows_out=rows_out, output_root=args.output_root, jsonl_name=jsonl_name)
+    output_path = os.path.join(save_dir, "predictions.jsonl")
+    with open(output_path, "w", encoding="utf-8") as file:
+        for row in output_rows:
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"[info] saved: {output_path}")
 
 
 if __name__ == "__main__":
