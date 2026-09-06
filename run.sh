@@ -74,13 +74,27 @@ if [ "$stage" -le 0 ] && [ "$stop_stage" -ge 0 ]; then
     fi
     python local/download_corpora.py "${download_args[@]}"
 
-    python local/prepare_ssd_jsonl.py +        --data-root "$data_root" +        --jsonl-root "$json_root" +        --prompt-file "$prompt_file" +        --target "$target" +        --corpora $test_corpora +        --validation-ratio "$validation_ratio" +        --seed "$seed"
+    python local/prepare_ssd_jsonl.py \
+        --data-root "$data_root" \
+        --jsonl-root "$json_root" \
+        --prompt-file "$prompt_file" \
+        --target "$target" \
+        --corpora $test_corpora \
+        --validation-ratio "$validation_ratio" \
+        --seed "$seed"
 fi
 
 if [ "$stage" -le 1 ] && [ "$stop_stage" -ge 1 ]; then
     echo "Stage 1: Finetune Qwen3-ASR on TinyStress"
     if [ "$force_train" = true ] || [ ! -f "$exp_dir/.done" ]; then
-        CUDA_VISIBLE_DEVICES="$gpuid" +            python finetuning/qwen3_asr_sft.py +                --seed "$seed" +                "${training_opts[@]}" +                --train_conf "$train_conf" +                --train_file "$json_root/tinystress/train.jsonl" +                --eval_file "$json_root/tinystress/dev.jsonl" +                --output_dir "$exp_dir"
+        CUDA_VISIBLE_DEVICES="$gpuid" \
+            python finetuning/qwen3_asr_sft.py \
+                --seed "$seed" \
+                "${training_opts[@]}" \
+                --train_conf "$train_conf" \
+                --train_file "$json_root/tinystress/train.jsonl" \
+                --eval_file "$json_root/tinystress/dev.jsonl" \
+                --output_dir "$exp_dir"
         touch "$exp_dir/.done"
     else
         echo "[info] training already completed: $exp_dir/.done"
@@ -93,7 +107,16 @@ if [ "$stage" -le 2 ] && [ "$stop_stage" -ge 2 ]; then
         input_jsonl="$json_root/$corpus/test.jsonl"
         results_root="$exp_dir/test/$corpus"
         mkdir -p "$results_root"
-        CUDA_VISIBLE_DEVICES="$gpuid" +            python finetuning/qwen3_asr_test.py +                "${inference_opts[@]}" +                --exp_dir "$exp_dir" +                --input_jsonl "$input_jsonl" +                --output_root "$results_root" +                --device cuda:0 +                --decoding_conf "$decoding_conf" +                --target "$target" +                > "$results_root/stage2.log"
+        CUDA_VISIBLE_DEVICES="$gpuid" \
+            python finetuning/qwen3_asr_test.py \
+                "${inference_opts[@]}" \
+                --exp_dir "$exp_dir" \
+                --input_jsonl "$input_jsonl" \
+                --output_root "$results_root" \
+                --device cuda:0 \
+                --decoding_conf "$decoding_conf" \
+                --target "$target" \
+                > "$results_root/stage2.log"
     done
 fi
 
@@ -107,7 +130,14 @@ if [ "$stage" -le 3 ] && [ "$stop_stage" -ge 3 ]; then
             echo "[WARNING] prediction file not found: $prediction_file" >&2
             continue
         fi
-        python local/evaluate_ssd.py +            --predictions "$prediction_file" +            --references "$reference_file" +            --results-dir "$results_dir" +            --corpus "$corpus" +            --split test +            --manifest "$json_root/manifest.json" +            | tee "$results_dir/metrics.txt"
+        python local/evaluate_ssd.py \
+            --predictions "$prediction_file" \
+            --references "$reference_file" \
+            --results-dir "$results_dir" \
+            --corpus "$corpus" \
+            --split test \
+            --manifest "$json_root/manifest.json" \
+            | tee "$results_dir/metrics.txt"
     done
 fi
 
@@ -120,7 +150,9 @@ if [ "$stage" -le 4 ] && [ "$stop_stage" -ge 4 ]; then
             echo "[WARNING] error analysis not found: $error_file" >&2
             continue
         fi
-        python local/plot_evaluation_results.py +            --error_case_path "$error_file" +            --save_fig_dir "$results_dir/imgs"
+        python local/plot_evaluation_results.py \
+            --error_case_path "$error_file" \
+            --save_fig_dir "$results_dir/imgs"
     done
 fi
 
