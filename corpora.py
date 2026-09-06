@@ -55,10 +55,20 @@ def compute_stress_binary(transcription: str, emphasis_indices: list[int]) -> li
 
 
 def _canonical_audio(audio: dict[str, Any]) -> dict[str, Any]:
+    if audio.get("array") is not None:
+        return {
+            "array": audio["array"],
+            "sampling_rate": int(audio["sampling_rate"]),
+            "path": audio.get("path"),
+        }
+
+    audio_bytes = audio.get("bytes")
+    audio_path = audio.get("path")
+    if audio_bytes is None and not audio_path:
+        raise ValueError("Audio sample has neither decoded samples, bytes, nor a path")
     return {
-        "array": audio["array"],
-        "sampling_rate": int(audio["sampling_rate"]),
-        "path": audio.get("path"),
+        "bytes": audio_bytes,
+        "path": audio_path,
     }
 
 
@@ -224,7 +234,7 @@ def _read_emphassess_rows(root: Path) -> tuple[list[dict[str, Any]], int]:
 
 
 def load_corpus(corpus: str, split: str = "test", data_root: str | Path = "data/raw"):
-    from datasets import Dataset, DatasetDict, load_from_disk
+    from datasets import Audio, Dataset, DatasetDict, load_from_disk
 
     if corpus not in SUPPORTED_CORPORA:
         raise ValueError(f"Unsupported corpus {corpus!r}; choose from {SUPPORTED_CORPORA}")
@@ -257,6 +267,10 @@ def load_corpus(corpus: str, split: str = "test", data_root: str | Path = "data/
             )
     else:
         raw = stored
+    if "audio" in raw.column_names:
+        # Access only the encoded path/bytes here. Datasets 4.x otherwise
+        # requires TorchCodec merely to materialize each example.
+        raw = raw.cast_column("audio", Audio(decode=False))
     if corpus == "tinystress":
         return raw.map(adapt_tinystress_example, remove_columns=raw.column_names)
     if corpus == "expresso":

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import sys
@@ -62,7 +63,23 @@ def build_target(
 
 
 def write_audio(audio: dict[str, Any], path: Path) -> None:
-    samples = np.asarray(audio["array"], dtype=np.float32)
+    if audio.get("array") is not None:
+        samples = np.asarray(audio["array"], dtype=np.float32)
+        sampling_rate = int(audio["sampling_rate"])
+    else:
+        audio_bytes = audio.get("bytes")
+        audio_path = audio.get("path")
+        if audio_bytes is not None:
+            source = io.BytesIO(audio_bytes)
+        elif audio_path:
+            source = audio_path
+        else:
+            raise ValueError("Audio sample has neither decoded samples, bytes, nor a path")
+        samples, sampling_rate = sf.read(
+            source,
+            dtype="float32",
+            always_2d=False,
+        )
     if samples.ndim == 2:
         samples = samples.mean(axis=-1)
     if samples.ndim != 1:
@@ -71,7 +88,7 @@ def write_audio(audio: dict[str, Any], path: Path) -> None:
     sf.write(
         str(path),
         samples,
-        int(audio["sampling_rate"]),
+        sampling_rate,
         subtype="PCM_16",
     )
 
