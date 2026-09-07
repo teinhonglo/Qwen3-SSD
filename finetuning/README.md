@@ -42,10 +42,10 @@ each validation pass. The Trainer logs `eval_ssd_precision`,
 `eval_tagged_transcript_wer` in addition to `eval_loss`. This evaluates the
 full development set by default. Set `model_args.eval_generation_max_samples`
 to a positive integer only when a faster, approximate validation metric is
-preferred. The TinyStress configs select periodic checkpoints by
-`eval_ssd_f1`. After training, the untouched final model is evaluated once
-more and saved as `checkpoint-last`; its `eval_last_ssd_f1` is compared with
-the best periodic score before `checkpoint-best` is created.
+preferred. The TinyStress configs evaluate and save at the end of every epoch,
+let Trainer reload the checkpoint selected by `eval_ssd_f1`, and preserve the
+evaluated final epoch as `checkpoint-last`. The selected checkpoint is also
+copied to `checkpoint-best`, and the final epoch is not decoded a second time.
 
 ## Inference
 
