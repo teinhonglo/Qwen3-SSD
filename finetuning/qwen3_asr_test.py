@@ -360,6 +360,60 @@ def output_subdir(input_jsonl: str, decoding_conf_path: str) -> str:
     return f"{data_name}_{decoding_name}"
 
 
+def infer_rows(
+    asr_wrapper,
+    rows: List[Dict[str, Any]],
+    sr: int,
+    resolved_decoding: Dict[str, Any],
+    target: Optional[str] = None,
+    log_every: int = 1,
+    progress_label: str = "",
+) -> List[Dict[str, Any]]:
+    output_rows = []
+    total = len(rows)
+    for index, row in enumerate(rows, start=1):
+        text_id = str(row.get("text_id", row.get("id", f"line{index}")))
+        target_format = target or row.get("target_format", "ts")
+        prediction = {
+            "id": text_id,
+            "text_id": text_id,
+            "source_dataset": row.get("source_dataset", ""),
+            "transcription": row.get("transcription", ""),
+            "emphasis_indices": row.get("emphasis_indices", []),
+            "pred_raw": "",
+            "pred_transcription": "",
+            "pred_stress": "",
+            "pred_gender": "",
+            "parse_error": "",
+        }
+        audio_path = row.get("audio", "")
+        if not audio_path or not os.path.isfile(audio_path):
+            prediction["parse_error"] = f"missing audio: {audio_path}"
+            output_rows.append(prediction)
+            continue
+        try:
+            generated = infer_one(
+                asr_wrapper,
+                audio_path=audio_path,
+                prompt=str(row.get("prompt", "") or ""),
+                sr=sr,
+                generation=resolved_decoding["generation"],
+                decoding_mode=resolved_decoding["mode"],
+                dola_conf=resolved_decoding["dola"],
+            )
+            nbest = generated if isinstance(generated, list) else [generated]
+            prediction["pred_raw"] = nbest[0] if nbest else ""
+            prediction["nbest"] = nbest
+            prediction.update(parse_ssd_output(prediction["pred_raw"], target_format))
+        except Exception as error:
+            prediction["parse_error"] = f"{type(error).__name__}: {error}"
+        output_rows.append(prediction)
+        if log_every > 0 and (index % log_every == 0 or index == total):
+            label = f"{progress_label} " if progress_label else ""
+            print(f"[{label}{index}/{total}] {text_id}: {prediction['parse_error'] or 'ok'}")
+    return output_rows
+
+
 def parse_args():
     parser = argparse.ArgumentParser("Qwen3-ASR SSD inference")
     parser.add_argument("--exp_dir", required=True)
@@ -402,46 +456,14 @@ def main():
     with open(os.path.join(save_dir, "resolved_decoding_config.json"), "w", encoding="utf-8") as file:
         json.dump(resolved_decoding, file, ensure_ascii=False, indent=2)
 
-    output_rows = []
     rows = load_jsonl(args.input_jsonl)
-    for index, row in enumerate(rows, start=1):
-        text_id = str(row.get("text_id", row.get("id", f"line{index}")))
-        target_format = args.target or row.get("target_format", "ts")
-        prediction = {
-            "id": text_id,
-            "text_id": text_id,
-            "source_dataset": row.get("source_dataset", ""),
-            "transcription": row.get("transcription", ""),
-            "emphasis_indices": row.get("emphasis_indices", []),
-            "pred_raw": "",
-            "pred_transcription": "",
-            "pred_stress": "",
-            "pred_gender": "",
-            "parse_error": "",
-        }
-        audio_path = row.get("audio", "")
-        if not audio_path or not os.path.isfile(audio_path):
-            prediction["parse_error"] = f"missing audio: {audio_path}"
-            output_rows.append(prediction)
-            continue
-        try:
-            generated = infer_one(
-                wrapper,
-                audio_path=audio_path,
-                prompt=str(row.get("prompt", "") or ""),
-                sr=int(model_args.get("sr", 16000)),
-                generation=resolved_decoding["generation"],
-                decoding_mode=resolved_decoding["mode"],
-                dola_conf=resolved_decoding["dola"],
-            )
-            nbest = generated if isinstance(generated, list) else [generated]
-            prediction["pred_raw"] = nbest[0] if nbest else ""
-            prediction["nbest"] = nbest
-            prediction.update(parse_ssd_output(prediction["pred_raw"], target_format))
-        except Exception as error:
-            prediction["parse_error"] = f"{type(error).__name__}: {error}"
-        output_rows.append(prediction)
-        print(f"[{index}/{len(rows)}] {text_id}: {prediction['parse_error'] or 'ok'}")
+    output_rows = infer_rows(
+        wrapper,
+        rows=rows,
+        sr=int(model_args.get("sr", 16000)),
+        resolved_decoding=resolved_decoding,
+        target=args.target,
+    )
 
     output_path = os.path.join(save_dir, "predictions.jsonl")
     with open(output_path, "w", encoding="utf-8") as file:

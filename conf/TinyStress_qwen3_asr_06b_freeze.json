@@ -40,7 +40,7 @@
             "audio_tower"
         ],
         "wandb_project": "qwen3-ssd-finetuning",
-        "wandb_log_model": "false"
+        "wandb_log_model": "false",
+        "eval_generation_metrics": true
     }
 ]
-

@@ -39,6 +39,7 @@
         "freeze_components": [],
         "wandb_project": "qwen3-ssd-finetuning",
         "wandb_log_model": "false",
+        "eval_generation_metrics": true,
         "spec_aug": {
             "apply": true,
             "freq_mask_param": 15,
@@ -46,4 +47,3 @@
         }
     }
 ]
-
