@@ -192,6 +192,17 @@ def save_prompt_txt(save_dir: str, prompt: str):
     with open(prompt_path, "w", encoding="utf-8") as f:
         f.write(prompt or "")
 
+
+def save_inference_files(save_dir, processor, model, default_prompt):
+    os.makedirs(save_dir, exist_ok=True)
+    processor.save_pretrained(save_dir)
+    if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+        processor.tokenizer.save_pretrained(save_dir)
+    if model is not None and getattr(model, "generation_config", None) is not None:
+        model.generation_config.save_pretrained(save_dir)
+    save_prompt_txt(save_dir, default_prompt)
+
+
 class CastFloatInputsTrainer(Trainer):
     def __init__(
         self,
@@ -420,17 +431,12 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         self.default_prompt = default_prompt
 
     def _save_infer_files(self, save_dir: str):
-        os.makedirs(save_dir, exist_ok=True)
-
-        self.processor.save_pretrained(save_dir)
-
-        if hasattr(self.processor, "tokenizer") and self.processor.tokenizer is not None:
-            self.processor.tokenizer.save_pretrained(save_dir)
-
-        if self.model is not None and getattr(self.model, "generation_config", None) is not None:
-            self.model.generation_config.save_pretrained(save_dir)
-
-        save_prompt_txt(save_dir, self.default_prompt)
+        save_inference_files(
+            save_dir,
+            self.processor,
+            self.model,
+            self.default_prompt,
+        )
 
     def on_save(self, args: TrainingArguments, state, control, **kwargs):
         if args.process_index != 0:
@@ -454,7 +460,7 @@ def save_best_checkpoint(
     if not best_src or not os.path.isdir(best_src):
         print(
             "[best] checkpoint-best not created: no best_model_checkpoint was selected. "
-            "Please make sure evaluation runs and load_best_model_at_end=true."
+            "Please make sure evaluation and checkpoint saving both run."
         )
         return
 
@@ -463,16 +469,88 @@ def save_best_checkpoint(
         shutil.rmtree(best_ckpt_dir)
     shutil.copytree(best_src, best_ckpt_dir)
 
-    if processor is not None:
-        processor.save_pretrained(best_ckpt_dir)
-        if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
-            processor.tokenizer.save_pretrained(best_ckpt_dir)
-
-    if model is not None and getattr(model, "generation_config", None) is not None:
-        model.generation_config.save_pretrained(best_ckpt_dir)
-
-    save_prompt_txt(best_ckpt_dir, default_prompt)
+    save_inference_files(
+        best_ckpt_dir,
+        processor,
+        model,
+        default_prompt,
+    )
     print(f"[best] Saved best checkpoint from {best_src} to {best_ckpt_dir}")
+
+
+def save_last_checkpoint(
+    trainer,
+    processor,
+    model,
+    default_prompt: str,
+    metrics: Dict[str, float],
+) -> str:
+    last_ckpt_dir = os.path.join(trainer.args.output_dir, "checkpoint-last")
+    if trainer.args.process_index == 0 and os.path.exists(last_ckpt_dir):
+        shutil.rmtree(last_ckpt_dir)
+    trainer.accelerator.wait_for_everyone()
+
+    trainer.save_model(last_ckpt_dir)
+    trainer.accelerator.wait_for_everyone()
+    if trainer.args.process_index == 0:
+        save_inference_files(
+            last_ckpt_dir,
+            processor,
+            model,
+            default_prompt,
+        )
+        trainer.state.save_to_json(os.path.join(last_ckpt_dir, "trainer_state.json"))
+        metrics_path = os.path.join(last_ckpt_dir, "eval_metrics.json")
+        with open(metrics_path, "w", encoding="utf-8") as file:
+            json.dump(metrics, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        print(f"[last] Saved evaluated final model to {last_ckpt_dir}")
+    trainer.accelerator.wait_for_everyone()
+    return last_ckpt_dir
+
+
+def choose_best_checkpoint_with_last(
+    trainer,
+    last_metrics: Dict[str, float],
+    last_ckpt_dir: str,
+) -> str:
+    metric_name = trainer.args.metric_for_best_model
+    if not metric_name:
+        raise ValueError("metric_for_best_model is required to select checkpoint-best")
+    metric_suffix = metric_name[5:] if metric_name.startswith("eval_") else metric_name
+    last_metric_name = f"eval_last_{metric_suffix}"
+    if last_metric_name not in last_metrics:
+        raise KeyError(
+            f"Final evaluation did not return {last_metric_name!r}; "
+            f"available metrics: {sorted(last_metrics)}"
+        )
+
+    last_metric = float(last_metrics[last_metric_name])
+    best_metric = trainer.state.best_metric
+    if best_metric is None:
+        last_is_best = True
+    elif trainer.args.greater_is_better:
+        last_is_best = last_metric > float(best_metric)
+    else:
+        last_is_best = last_metric < float(best_metric)
+
+    if last_is_best:
+        trainer.state.best_metric = last_metric
+        trainer.state.best_global_step = trainer.state.global_step
+        trainer.state.best_model_checkpoint = last_ckpt_dir
+        if trainer.args.process_index == 0:
+            print(
+                f"[best] Final model is best: {metric_name}={last_metric:.6f} "
+                f"at step {trainer.state.global_step}"
+            )
+    else:
+        if trainer.args.process_index == 0:
+            print(
+                f"[best] Keep {trainer.state.best_model_checkpoint}: "
+                f"{metric_name}={float(best_metric):.6f}; "
+                f"final={last_metric:.6f}"
+            )
+    return trainer.state.best_model_checkpoint
 
 
 def parse_args():
@@ -545,6 +623,11 @@ def main():
 
     sr = int(model_args_conf.get("sr", 16000))
     eval_generation_metrics = bool(model_args_conf.get("eval_generation_metrics", False))
+    if eval_generation_metrics and training_args_conf.get("load_best_model_at_end", False):
+        raise ValueError(
+            "load_best_model_at_end must be false when generation-based validation "
+            "is enabled so the true final model can be evaluated and saved first"
+        )
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     # LoRA
@@ -747,9 +830,27 @@ def main():
     else:
         trainer.train()
 
+    if generation_eval_config is not None:
+        last_metrics = trainer.evaluate(metric_key_prefix="eval_last")
+        last_ckpt_dir = os.path.join(training_args.output_dir, "checkpoint-last")
+        best_src = choose_best_checkpoint_with_last(
+            trainer,
+            last_metrics,
+            last_ckpt_dir,
+        )
+        save_last_checkpoint(
+            trainer,
+            processor,
+            model,
+            default_prompt,
+            last_metrics,
+        )
+    else:
+        best_src = getattr(trainer.state, "best_model_checkpoint", None)
+
     if trainer.args.process_index == 0:
         save_best_checkpoint(
-            best_src=getattr(trainer.state, "best_model_checkpoint", None),
+            best_src=best_src,
             output_dir=training_args.output_dir,
             processor=processor,
             model=model,

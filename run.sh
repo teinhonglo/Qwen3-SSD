@@ -55,10 +55,13 @@ case "$inference_mode" in
     latest)
         inference_opts+=(--auto_latest_checkpoint)
         ;;
+    last)
+        inference_opts+=(--auto_last_checkpoint)
+        ;;
     root)
         ;;
     *)
-        echo "[ERROR] inference_mode must be best, latest, or root" >&2
+        echo "[ERROR] inference_mode must be best, latest, last, or root" >&2
         exit 1
         ;;
 esac

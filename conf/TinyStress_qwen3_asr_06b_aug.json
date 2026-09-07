@@ -24,9 +24,9 @@
         "report_to": [
             "wandb"
         ],
-        "load_best_model_at_end": true,
-        "metric_for_best_model": "eval_loss",
-        "greater_is_better": false
+        "load_best_model_at_end": false,
+        "metric_for_best_model": "eval_ssd_f1",
+        "greater_is_better": true
     },
     {
         "model_path": "Qwen/Qwen3-ASR-0.6B",

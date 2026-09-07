@@ -42,7 +42,10 @@ each validation pass. The Trainer logs `eval_ssd_precision`,
 `eval_tagged_transcript_wer` in addition to `eval_loss`. This evaluates the
 full development set by default. Set `model_args.eval_generation_max_samples`
 to a positive integer only when a faster, approximate validation metric is
-preferred.
+preferred. The TinyStress configs select periodic checkpoints by
+`eval_ssd_f1`. After training, the untouched final model is evaluated once
+more and saved as `checkpoint-last`; its `eval_last_ssd_f1` is compared with
+the best periodic score before `checkpoint-best` is created.
 
 ## Inference
 
@@ -57,8 +60,9 @@ python finetuning/qwen3_asr_test.py \
   --device cuda:0
 ```
 
-`--auto_latest_checkpoint` is available when the most recent checkpoint is
-preferred. The supported SSD targets are `ts`, `gts`, `s`, `gs`, and
+`--auto_latest_checkpoint` selects the most recent numbered periodic
+checkpoint. `--auto_last_checkpoint` selects the evaluated final model in
+`checkpoint-last`. The supported SSD targets are `ts`, `gts`, `s`, `gs`, and
 `tgs`.
 
 For the normal end-to-end workflow, run `./run.sh --stage 0 --stop_stage 5`

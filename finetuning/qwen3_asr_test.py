@@ -29,13 +29,26 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     return max(candidates)[1] if candidates else None
 
 
-def resolve_checkpoint(exp_dir: str, use_best: bool, use_latest: bool) -> str:
-    if use_best and use_latest:
-        raise ValueError("--auto_best_checkpoint and --auto_latest_checkpoint are mutually exclusive")
+def resolve_checkpoint(
+    exp_dir: str,
+    use_best: bool,
+    use_latest: bool,
+    use_last: bool = False,
+) -> str:
+    if sum((use_best, use_latest, use_last)) > 1:
+        raise ValueError(
+            "--auto_best_checkpoint, --auto_latest_checkpoint, and "
+            "--auto_last_checkpoint are mutually exclusive"
+        )
     if use_best:
         checkpoint = os.path.join(exp_dir, "checkpoint-best")
         if not os.path.isdir(checkpoint):
             raise FileNotFoundError(f"Best checkpoint not found: {checkpoint}")
+        return checkpoint
+    if use_last:
+        checkpoint = os.path.join(exp_dir, "checkpoint-last")
+        if not os.path.isdir(checkpoint):
+            raise FileNotFoundError(f"Last checkpoint not found: {checkpoint}")
         return checkpoint
     if use_latest:
         checkpoint = find_latest_checkpoint(exp_dir)
@@ -419,6 +432,7 @@ def parse_args():
     parser.add_argument("--exp_dir", required=True)
     parser.add_argument("--auto_latest_checkpoint", action="store_true")
     parser.add_argument("--auto_best_checkpoint", action="store_true")
+    parser.add_argument("--auto_last_checkpoint", action="store_true")
     parser.add_argument("--input_jsonl", required=True)
     parser.add_argument("--output_root", default="checkpoints")
     parser.add_argument("--device", default="cuda:0")
@@ -446,6 +460,7 @@ def main():
         args.exp_dir,
         args.auto_best_checkpoint,
         args.auto_latest_checkpoint,
+        args.auto_last_checkpoint,
     )
     print(f"[info] use checkpoint: {checkpoint_path}")
     dtype = resolve_dtype(str(model_args.get("dtype", "auto")), args.device)
