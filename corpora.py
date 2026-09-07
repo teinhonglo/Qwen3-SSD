@@ -268,9 +268,12 @@ def load_corpus(corpus: str, split: str = "test", data_root: str | Path = "data/
     else:
         raw = stored
     if "audio" in raw.column_names:
-        # Access only the encoded path/bytes here. Datasets 4.x otherwise
-        # requires TorchCodec merely to materialize each example.
-        raw = raw.cast_column("audio", Audio(decode=False))
+        audio_feature = raw.features["audio"]
+        # Only actual Audio features need decoding disabled. StressPresso stores
+        # audio as an already-decoded array/sampling-rate struct; casting that
+        # struct to Audio makes Datasets 4.x invoke TorchCodec to encode it.
+        if isinstance(audio_feature, Audio) and audio_feature.decode:
+            raw = raw.cast_column("audio", Audio(decode=False))
     if corpus == "tinystress":
         return raw.map(adapt_tinystress_example, remove_columns=raw.column_names)
     if corpus == "expresso":
