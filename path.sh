@@ -1,6 +1,7 @@
 export PYTHONNOUSERSITE=1
-# Keep experiment tracking available while defaulting to a network-free run.
-export WANDB_MODE=${WANDB_MODE:-offline}
+# Avoid making training depend on the W&B background service. Set WANDB_MODE
+# explicitly to "offline" or "online" before running to enable tracking.
+export WANDB_MODE=${WANDB_MODE:-disabled}
 #export PYTHONPATH="."
 
 eval "$(conda shell.bash hook)"
