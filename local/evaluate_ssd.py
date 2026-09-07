@@ -172,15 +172,13 @@ def gender_metrics(pairs: list[tuple[str, str]]) -> dict[str, Any] | None:
     }
 
 
-def evaluate(
-    predictions_path: Path,
-    references_path: Path,
+def evaluate_rows(
+    prediction_rows: list[dict[str, Any]],
+    reference_rows: list[dict[str, Any]],
     corpus: str,
     split: str,
     manifest_path: Path | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    prediction_rows = load_jsonl(predictions_path)
-    reference_rows = load_jsonl(references_path)
     predictions_by_id = {
         str(row.get("id", row.get("text_id"))): row for row in prediction_rows
     }
@@ -300,6 +298,22 @@ def evaluate(
         },
     }
     return results, error_cases
+
+
+def evaluate(
+    predictions_path: Path,
+    references_path: Path,
+    corpus: str,
+    split: str,
+    manifest_path: Path | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return evaluate_rows(
+        load_jsonl(predictions_path),
+        load_jsonl(references_path),
+        corpus,
+        split,
+        manifest_path,
+    )
 
 
 def main() -> None:

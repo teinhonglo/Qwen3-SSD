@@ -55,10 +55,13 @@ case "$inference_mode" in
     latest)
         inference_opts+=(--auto_latest_checkpoint)
         ;;
+    last)
+        inference_opts+=(--auto_last_checkpoint)
+        ;;
     root)
         ;;
     *)
-        echo "[ERROR] inference_mode must be best, latest, or root" >&2
+        echo "[ERROR] inference_mode must be best, latest, last, or root" >&2
         exit 1
         ;;
 esac
@@ -94,6 +97,9 @@ if [ "$stage" -le 1 ] && [ "$stop_stage" -ge 1 ]; then
                 --train_conf "$train_conf" \
                 --train_file "$json_root/tinystress/train.jsonl" \
                 --eval_file "$json_root/tinystress/dev.jsonl" \
+                --decoding_conf "$decoding_conf" \
+                --target "$target" \
+                --manifest "$json_root/manifest.json" \
                 --output_dir "$exp_dir"
         touch "$exp_dir/.done"
     else

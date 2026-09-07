@@ -19,14 +19,25 @@ import os
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 import numpy as np
 import random
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import librosa
 import torch
 from datasets import load_dataset
+from finetuning.qwen3_asr_test import (
+    infer_rows,
+    load_decoding_conf,
+    resolve_decoding_conf,
+)
+from local.evaluate_ssd import evaluate_rows
 from qwen_asr import Qwen3ASRModel
 from transformers import (GenerationConfig, Trainer, TrainerCallback,
                           TrainingArguments, BitsAndBytesConfig)
@@ -147,13 +158,13 @@ class DataCollatorForQwen3ASRFinetuning:
         )
 
         prefix_lens = prefix_inputs["attention_mask"].sum(dim=1).tolist()
+        attention_mask = full_inputs["attention_mask"]
+        prefix_starts = attention_mask.long().argmax(dim=1).tolist()
         labels = full_inputs["input_ids"].clone()
-        for i, pl in enumerate(prefix_lens):
-            labels[i, :pl] = -100
+        for i, (start, length) in enumerate(zip(prefix_starts, prefix_lens)):
+            labels[i, start:start + length] = -100
 
-        pad_id = self.processor.tokenizer.pad_token_id
-        if pad_id is not None:
-            labels[labels == pad_id] = -100
+        labels[attention_mask == 0] = -100
 
         full_inputs["labels"] = labels
         return full_inputs
@@ -181,10 +192,28 @@ def save_prompt_txt(save_dir: str, prompt: str):
     with open(prompt_path, "w", encoding="utf-8") as f:
         f.write(prompt or "")
 
+
+def save_inference_files(save_dir, processor, model, default_prompt):
+    os.makedirs(save_dir, exist_ok=True)
+    processor.save_pretrained(save_dir)
+    if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+        processor.tokenizer.save_pretrained(save_dir)
+    if model is not None and getattr(model, "generation_config", None) is not None:
+        model.generation_config.save_pretrained(save_dir)
+    save_prompt_txt(save_dir, default_prompt)
+
+
 class CastFloatInputsTrainer(Trainer):
-    def __init__(self, *args, spec_aug_config=None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        spec_aug_config=None,
+        generation_eval_config=None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.spec_aug_config = spec_aug_config or {}
+        self.generation_eval_config = generation_eval_config
 
     @staticmethod
     def _mask_axis(features, axis, max_width, valid_width=None):
@@ -253,6 +282,109 @@ class CastFloatInputsTrainer(Trainer):
                     inputs[k] = v.to(dtype=model_dtype)
         return self._apply_spec_augment(inputs)
 
+    def _compute_generation_metrics(self, metric_key_prefix: str) -> Dict[str, float]:
+        config = self.generation_eval_config
+        dataset = config["dataset"]
+        max_samples = config.get("max_samples")
+        sample_count = len(dataset) if max_samples is None else min(len(dataset), max_samples)
+        rows = [dataset[index] for index in range(sample_count)]
+
+        started_at = time.perf_counter()
+        was_training = self.model.training
+        try:
+            predictions = infer_rows(
+                SimpleNamespace(model=self.model, processor=config["processor"]),
+                rows=rows,
+                sr=config["sampling_rate"],
+                resolved_decoding=config["resolved_decoding"],
+                target=config.get("target"),
+                log_every=config.get("log_every", 100),
+                progress_label="validation",
+            )
+        finally:
+            if was_training:
+                self.model.train()
+
+        results, _ = evaluate_rows(
+            predictions,
+            rows,
+            config["corpus"],
+            config["split"],
+            config.get("manifest_path"),
+        )
+        stress_metrics = results.get("metrics") or {}
+        transcription_metrics = results["transcription_metrics"]
+        coverage = results["coverage"]
+        metrics = {
+            f"{metric_key_prefix}_ssd_precision": float(stress_metrics.get("precision", 0.0)),
+            f"{metric_key_prefix}_ssd_recall": float(stress_metrics.get("recall", 0.0)),
+            f"{metric_key_prefix}_ssd_f1": float(stress_metrics.get("f1", 0.0)),
+            f"{metric_key_prefix}_ssd_tp": float(stress_metrics.get("tp", 0)),
+            f"{metric_key_prefix}_ssd_tn": float(stress_metrics.get("tn", 0)),
+            f"{metric_key_prefix}_ssd_fp": float(stress_metrics.get("fp", 0)),
+            f"{metric_key_prefix}_ssd_fn": float(stress_metrics.get("fn", 0)),
+            f"{metric_key_prefix}_coverage_rate": float(coverage["coverage_rate"]),
+            f"{metric_key_prefix}_num_evaluated": float(coverage["num_evaluated"]),
+            f"{metric_key_prefix}_num_skipped": float(coverage["num_skipped"]),
+            f"{metric_key_prefix}_generation_runtime": time.perf_counter() - started_at,
+        }
+        if transcription_metrics["wer"] is not None:
+            metrics[f"{metric_key_prefix}_wer"] = float(transcription_metrics["wer"])
+        if transcription_metrics["tagged_transcript_wer"] is not None:
+            metrics[f"{metric_key_prefix}_tagged_transcript_wer"] = float(
+                transcription_metrics["tagged_transcript_wer"]
+            )
+        gender_metrics = results.get("gender_metrics")
+        if gender_metrics is not None:
+            metrics[f"{metric_key_prefix}_gender_accuracy"] = float(
+                gender_metrics["accuracy"]
+            )
+            metrics[f"{metric_key_prefix}_gender_mcc"] = float(
+                gender_metrics["mcc"]
+            )
+        return metrics
+
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        if self.generation_eval_config is None or eval_dataset is not None:
+            return metrics
+
+        self.accelerator.wait_for_everyone()
+        payload = [None]
+        if self.args.process_index == 0:
+            try:
+                payload[0] = {
+                    "metrics": self._compute_generation_metrics(metric_key_prefix),
+                    "error": "",
+                }
+            except Exception as error:
+                payload[0] = {
+                    "metrics": {},
+                    "error": f"{type(error).__name__}: {error}",
+                }
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast_object_list(payload, src=0)
+        self.accelerator.wait_for_everyone()
+
+        if payload[0]["error"]:
+            raise RuntimeError(
+                f"Generation-based validation failed: {payload[0]['error']}"
+            )
+        generation_metrics = payload[0]["metrics"]
+        metrics.update(generation_metrics)
+        self.log(generation_metrics)
+        return metrics
+
 
 def apply_freeze_components(model, freeze_components):
     if isinstance(freeze_components, str):
@@ -299,17 +431,12 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         self.default_prompt = default_prompt
 
     def _save_infer_files(self, save_dir: str):
-        os.makedirs(save_dir, exist_ok=True)
-
-        self.processor.save_pretrained(save_dir)
-
-        if hasattr(self.processor, "tokenizer") and self.processor.tokenizer is not None:
-            self.processor.tokenizer.save_pretrained(save_dir)
-
-        if self.model is not None and getattr(self.model, "generation_config", None) is not None:
-            self.model.generation_config.save_pretrained(save_dir)
-
-        save_prompt_txt(save_dir, self.default_prompt)
+        save_inference_files(
+            save_dir,
+            self.processor,
+            self.model,
+            self.default_prompt,
+        )
 
     def on_save(self, args: TrainingArguments, state, control, **kwargs):
         if args.process_index != 0:
@@ -322,36 +449,23 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         self._save_infer_files(ckpt_dir)
         return control
 
-def save_best_checkpoint(
-    best_src: str,
+
+def copy_checkpoint_alias(
+    source: Optional[str],
     output_dir: str,
-    processor=None,
-    model=None,
-    default_prompt: str = "",
-    best_ckpt_name: str = "checkpoint-best",
+    checkpoint_name: str = "checkpoint-best",
 ):
-    if not best_src or not os.path.isdir(best_src):
-        print(
-            "[best] checkpoint-best not created: no best_model_checkpoint was selected. "
-            "Please make sure evaluation runs and load_best_model_at_end=true."
+    if not source or not os.path.isdir(source):
+        raise FileNotFoundError(
+            f"Cannot create {checkpoint_name}: source checkpoint is missing. "
+            "Make sure evaluation and checkpoint saving both run."
         )
-        return
 
-    best_ckpt_dir = os.path.join(output_dir, best_ckpt_name)
-    if os.path.exists(best_ckpt_dir):
-        shutil.rmtree(best_ckpt_dir)
-    shutil.copytree(best_src, best_ckpt_dir)
-
-    if processor is not None:
-        processor.save_pretrained(best_ckpt_dir)
-        if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
-            processor.tokenizer.save_pretrained(best_ckpt_dir)
-
-    if model is not None and getattr(model, "generation_config", None) is not None:
-        model.generation_config.save_pretrained(best_ckpt_dir)
-
-    save_prompt_txt(best_ckpt_dir, default_prompt)
-    print(f"[best] Saved best checkpoint from {best_src} to {best_ckpt_dir}")
+    destination = os.path.join(output_dir, checkpoint_name)
+    if os.path.exists(destination):
+        shutil.rmtree(destination)
+    shutil.copytree(source, destination)
+    print(f"[checkpoint] Copied {source} to {destination}")
 
 
 def parse_args():
@@ -364,6 +478,9 @@ def parse_args():
     p.add_argument("--train_file", type=str, default="train.jsonl")
     p.add_argument("--eval_file", type=str, default="dev.jsonl")
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-finetuning-out")
+    p.add_argument("--decoding_conf", type=str, default="conf/decoding/basic_decoding.json")
+    p.add_argument("--target", type=str, default=None)
+    p.add_argument("--manifest", type=str, default="")
 
     # Resume / warm start
     p.add_argument("--resume_from", type=str, default="")
@@ -420,8 +537,7 @@ def main():
         raise KeyError("model_args.model_path is required in train_conf")
 
     sr = int(model_args_conf.get("sr", 16000))
-    eval_max_new_tokens = int(model_args_conf.get("eval_max_new_tokens", 256))
-
+    eval_generation_metrics = bool(model_args_conf.get("eval_generation_metrics", False))
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     # LoRA
     lora_config = model_args_conf.get("lora_config", None)
@@ -501,9 +617,36 @@ def main():
             "validation": args_cli.eval_file,
         },
     )
+    if eval_generation_metrics:
+        eval_columns = set(raw_ds["validation"].column_names)
+        missing_columns = {"audio", "prompt", "transcription"} - eval_columns
+        has_stress_labels = bool(
+            {"stress_pattern_binary", "emphasis_indices"} & eval_columns
+        )
+        if missing_columns or not has_stress_labels:
+            details = sorted(missing_columns)
+            if not has_stress_labels:
+                details.append("stress_pattern_binary or emphasis_indices")
+            raise ValueError(
+                "Generation-based validation requires the prepared SSD fields: "
+                + ", ".join(details)
+            )
     ds = raw_ds.map(make_preprocess_fn_prefix_only(processor), num_proc=1)
 
-    keep = {"prompt", "audio", "target", "prefix_text"}
+    keep = {
+        "id",
+        "text_id",
+        "prompt",
+        "audio",
+        "target",
+        "prefix_text",
+        "transcription",
+        "stress_pattern_binary",
+        "emphasis_indices",
+        "source_dataset",
+        "target_format",
+        "gender",
+    }
     for split in ds.keys():
         drop = [c for c in ds[split].column_names if c not in keep]
         if drop:
@@ -512,6 +655,30 @@ def main():
     default_prompt = extract_default_prompt(ds["train"])
 
     collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=sr)
+
+    generation_eval_config = None
+    if eval_generation_metrics:
+        max_samples = model_args_conf.get("eval_generation_max_samples")
+        if max_samples is not None:
+            max_samples = int(max_samples)
+            if max_samples <= 0:
+                raise ValueError("model_args.eval_generation_max_samples must be positive")
+        eval_path = Path(args_cli.eval_file)
+        generation_eval_config = {
+            "dataset": ds["validation"],
+            "processor": processor,
+            "sampling_rate": sr,
+            "resolved_decoding": resolve_decoding_conf(
+                model_args_conf,
+                load_decoding_conf(args_cli.decoding_conf),
+            ),
+            "target": args_cli.target,
+            "manifest_path": Path(args_cli.manifest) if args_cli.manifest else None,
+            "corpus": eval_path.parent.name or "validation",
+            "split": eval_path.stem,
+            "max_samples": max_samples,
+            "log_every": int(model_args_conf.get("eval_generation_log_every", 100)),
+        }
 
     training_args_conf["run_name"] = os.path.basename(args_cli.output_dir)
     if model_args_conf.get("wandb_project"):
@@ -541,6 +708,7 @@ def main():
             ),
         ],
         spec_aug_config=model_args_conf.get("spec_aug", {}),
+        generation_eval_config=generation_eval_config,
     )
 
     os.makedirs(training_args.output_dir, exist_ok=True)
@@ -571,15 +739,29 @@ def main():
     else:
         trainer.train()
 
+    # Epoch-based evaluation runs before checkpoint saving. Trainer then reloads
+    # the selected best weights, while the latest numbered checkpoint remains the
+    # evaluated final epoch.
+    checkpoint_aliases = [
+        (find_latest_checkpoint(training_args.output_dir), "checkpoint-last"),
+        (getattr(trainer.state, "best_model_checkpoint", None), "checkpoint-best"),
+    ]
+    for source, checkpoint_name in checkpoint_aliases:
+        if not source or not os.path.isdir(source):
+            raise FileNotFoundError(
+                f"Cannot create {checkpoint_name}: source checkpoint is missing"
+            )
+
+    trainer.accelerator.wait_for_everyone()
     if trainer.args.process_index == 0:
-        save_best_checkpoint(
-            best_src=getattr(trainer.state, "best_model_checkpoint", None),
-            output_dir=training_args.output_dir,
-            processor=processor,
-            model=model,
-            default_prompt=default_prompt,
-        )
+        for source, checkpoint_name in checkpoint_aliases:
+            copy_checkpoint_alias(
+                source=source,
+                output_dir=training_args.output_dir,
+                checkpoint_name=checkpoint_name,
+            )
         save_prompt_txt(training_args.output_dir, default_prompt)
+    trainer.accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":
