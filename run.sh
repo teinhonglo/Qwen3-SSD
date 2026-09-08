@@ -49,7 +49,7 @@ conf_tag=$(basename -s .json "$train_conf")
 decoding_tag=$(basename -s .json "$decoding_conf")
 prompt_name=$(basename "$prompt_file")
 prompt_tag=${prompt_name%.*}
-exp_dir="exp/TinyStress/${conf_tag}_${prompt_tag}_${target}"
+exp_dir="exp/tinystress/${conf_tag}_${prompt_tag}"
 
 training_opts=()
 if [ -n "$checkpoint" ]; then

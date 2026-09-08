@@ -29,7 +29,7 @@ error analysis, and plotting. Use `--test_corpora` to select a subset and
 `--prompt_file` is required and must be an absolute path. Its filename without
 the extension is included in the experiment directory name, for example
 `prompt_ts.txt` produces
-`exp/TinyStress/tinystress_qwen3_asr_06b_prompt_ts_ts` with the default config.
+`exp/tinystress/tinystress_qwen3_asr_06b_prompt_ts` with the default config.
 
 <br>
 
