@@ -9,14 +9,15 @@ adapters for TinyStress, StressTest, StressPresso, Expresso, and EmphAssess.
 
 ```bash
 pip install -e ".[ssd]"
-./run.sh --stage 0 --stop_stage 5
+./run.sh --prompt_file /absolute/path/to/prompt_ts.txt --stage 0 --stop_stage 5
 ```
 
 The default target is `ts` (transcription plus a JSON stress pattern).
 The auxiliary `gts`, `s`, `gs`, and `tgs` formats remain available:
 
 ```bash
-./run.sh --target s --stage 0 --stop_stage 5
+./run.sh --prompt_file /absolute/path/to/prompt_s.txt \
+  --target s --stage 0 --stop_stage 5
 ```
 
 Stage 0 downloads and validates all configured corpora, creates a seeded
@@ -25,6 +26,10 @@ Stage 0 downloads and validates all configured corpora, creates a seeded
 Stages 2-5 run cross-corpus inference, evaluation with explicit coverage,
 error analysis, and plotting. Use `--test_corpora` to select a subset and
 `--train_conf` or `--decoding_conf` to choose another configuration.
+`--prompt_file` is required and must be an absolute path. Its filename without
+the extension is included in the experiment directory name, for example
+`prompt_ts.txt` produces
+`exp/TinyStress/tinystress_qwen3_asr_06b_prompt_ts_ts` with the default config.
 
 <br>
 

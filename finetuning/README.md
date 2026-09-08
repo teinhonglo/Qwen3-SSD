@@ -78,5 +78,7 @@ checkpoint. `--auto_last_checkpoint` selects the evaluated final model in
 `checkpoint-last`. The supported SSD targets are `ts`, `gts`, `s`, `gs`, and
 `tgs`.
 
-For the normal end-to-end workflow, run `./run.sh --stage 0 --stop_stage 5`
-from the repository root.
+For the normal end-to-end workflow, run
+`./run.sh --prompt_file /absolute/path/to/prompt_ts.txt --stage 0 --stop_stage 5`
+from the repository root. The prompt filename without its extension is included
+in the experiment directory name.
