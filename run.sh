@@ -16,7 +16,7 @@ validation_ratio=0.1
 force_download=false
 
 # Training and inference configuration
-train_conf=conf/TinyStress_qwen3_asr_06b.json
+train_conf=conf/tinystress_qwen3_asr_06b.json
 decoding_conf=conf/decoding/basic_decoding.json
 gpuid=0
 seed=66

@@ -19,7 +19,7 @@ supported corpora and target formats.
 
 ```bash
 python finetuning/qwen3_asr_sft.py \
-  --train_conf conf/TinyStress_qwen3_asr_06b.json \
+  --train_conf conf/tinystress_qwen3_asr_06b.json \
   --train_file data-json/tinystress/train.jsonl \
   --eval_file data-json/tinystress/dev.jsonl \
   --decoding_conf conf/decoding/basic_decoding.json \
@@ -39,10 +39,10 @@ The provided adaptation configs follow the Qwen3-SLU LoRA layout:
 
 | Config | Trainable scope |
 | --- | --- |
-| `TinyStress_qwen3_asr_06b.json` | Full model |
-| `TinyStress_qwen3_asr_06b_freeze.json` | Full fine-tuning except `thinker.audio_tower` |
-| `TinyStress_qwen3_asr_06b_lora.json` | LoRA plus trainable token embeddings and LM head |
-| `TinyStress_qwen3_asr_06b_lora_woemblmhead_frozenaudio.json` | Text-backbone LoRA only; audio tower, token embeddings, and LM head remain frozen |
+| `tinystress_qwen3_asr_06b.json` | Full model |
+| `tinystress_qwen3_asr_06b_freeze.json` | Full fine-tuning except `thinker.audio_tower` |
+| `tinystress_qwen3_asr_06b_lora.json` | LoRA plus trainable token embeddings and LM head |
+| `tinystress_qwen3_asr_06b_lora_woemblmhead_frozenaudio.json` | Text-backbone LoRA only; audio tower, token embeddings, and LM head remain frozen |
 
 The frozen-audio LoRA config uses both the PEFT `exclude_modules` regex and
 `freeze_components` as an explicit safeguard. It requires PEFT 0.14.0 or
