@@ -35,6 +35,19 @@ generation defaults, component freezing, SpecAugment, LoRA/QLoRA, and W&B
 metadata. Use `--resume`, `--resume_from`, or `--init_from_checkpoint` when
 continuing an experiment.
 
+The provided adaptation configs follow the Qwen3-SLU LoRA layout:
+
+| Config | Trainable scope |
+| --- | --- |
+| `TinyStress_qwen3_asr_06b.json` | Full model |
+| `TinyStress_qwen3_asr_06b_freeze.json` | Full fine-tuning except `thinker.audio_tower` |
+| `TinyStress_qwen3_asr_06b_lora.json` | LoRA plus trainable token embeddings and LM head |
+| `TinyStress_qwen3_asr_06b_lora_woemblmhead_frozenaudio.json` | Text-backbone LoRA only; audio tower, token embeddings, and LM head remain frozen |
+
+The frozen-audio LoRA config uses both the PEFT `exclude_modules` regex and
+`freeze_components` as an explicit safeguard. It requires PEFT 0.14.0 or
+newer. Select a variant through the existing `--train_conf` option.
+
 Set `model_args.eval_generation_metrics` to `true` to run the same greedy
 generation and SSD evaluation used by the inference/evaluation stages after
 each validation pass. The Trainer logs `eval_ssd_precision`,
