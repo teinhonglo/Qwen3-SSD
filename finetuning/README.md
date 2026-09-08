@@ -19,7 +19,7 @@ supported corpora and target formats.
 
 ```bash
 python finetuning/qwen3_asr_sft.py \
-  --train_conf conf/TinyStress_qwen3_asr_06b.json \
+  --train_conf conf/tinystress_qwen3_asr_06b.json \
   --train_file data-json/tinystress/train.jsonl \
   --eval_file data-json/tinystress/dev.jsonl \
   --decoding_conf conf/decoding/basic_decoding.json \
@@ -34,6 +34,19 @@ selects the base model and model-specific settings such as sample rate,
 generation defaults, component freezing, SpecAugment, LoRA/QLoRA, and W&B
 metadata. Use `--resume`, `--resume_from`, or `--init_from_checkpoint` when
 continuing an experiment.
+
+The provided adaptation configs follow the Qwen3-SLU LoRA layout:
+
+| Config | Trainable scope |
+| --- | --- |
+| `tinystress_qwen3_asr_06b.json` | Full model |
+| `tinystress_qwen3_asr_06b_freeze.json` | Full fine-tuning except `thinker.audio_tower` |
+| `tinystress_qwen3_asr_06b_lora.json` | LoRA plus trainable token embeddings and LM head |
+| `tinystress_qwen3_asr_06b_lora_woemblmhead_frozenaudio.json` | Text-backbone LoRA only; audio tower, token embeddings, and LM head remain frozen |
+
+The frozen-audio LoRA config uses both the PEFT `exclude_modules` regex and
+`freeze_components` as an explicit safeguard. It requires PEFT 0.14.0 or
+newer. Select a variant through the existing `--train_conf` option.
 
 Set `model_args.eval_generation_metrics` to `true` to run the same greedy
 generation and SSD evaluation used by the inference/evaluation stages after
@@ -65,5 +78,7 @@ checkpoint. `--auto_last_checkpoint` selects the evaluated final model in
 `checkpoint-last`. The supported SSD targets are `ts`, `gts`, `s`, `gs`, and
 `tgs`.
 
-For the normal end-to-end workflow, run `./run.sh --stage 0 --stop_stage 5`
-from the repository root.
+For the normal end-to-end workflow, run
+`./run.sh --prompt_file /absolute/path/to/prompt_ts.txt --stage 0 --stop_stage 5`
+from the repository root. The prompt filename without its extension is included
+in the experiment directory name.

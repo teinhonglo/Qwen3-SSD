@@ -35,7 +35,7 @@
         "temperature": 1,
         "top_p": 1,
         "freeze_components": [
-            "audio_tower"
+            "thinker.audio_tower"
         ],
         "wandb_project": "qwen3-ssd-finetuning",
         "wandb_log_model": "false",

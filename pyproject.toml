@@ -42,7 +42,7 @@ ssd = [
   "datasets",
   "matplotlib",
   "pandas",
-  "peft",
+  "peft>=0.14.0",
   "pyphen",
   "seaborn",
   "wandb",

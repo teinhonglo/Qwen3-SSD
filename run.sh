@@ -16,7 +16,7 @@ validation_ratio=0.1
 force_download=false
 
 # Training and inference configuration
-train_conf=conf/TinyStress_qwen3_asr_06b.json
+train_conf=conf/tinystress_qwen3_asr_06b.json
 decoding_conf=conf/decoding/basic_decoding.json
 gpuid=0
 seed=66
@@ -25,10 +25,15 @@ inference_mode=best
 force_train=false
 
 . ./local/parse_options.sh
-. ./path.sh
 
 if [ -z "$prompt_file" ]; then
-    prompt_file="prompt/prompt_${target}.txt"
+    echo "[ERROR] --prompt_file is required and must be an absolute path" >&2
+    exit 1
+fi
+
+if [[ "$prompt_file" != /* ]]; then
+    echo "[ERROR] --prompt_file must be an absolute path: $prompt_file" >&2
+    exit 1
 fi
 
 for required_file in "$train_conf" "$decoding_conf" "$prompt_file"; do
@@ -38,9 +43,13 @@ for required_file in "$train_conf" "$decoding_conf" "$prompt_file"; do
     fi
 done
 
+. ./path.sh
+
 conf_tag=$(basename -s .json "$train_conf")
 decoding_tag=$(basename -s .json "$decoding_conf")
-exp_dir="exp/TinyStress/${conf_tag}_${target}"
+prompt_name=$(basename "$prompt_file")
+prompt_tag=${prompt_name%.*}
+exp_dir="exp/tinystress/${conf_tag}_${prompt_tag}"
 
 training_opts=()
 if [ -n "$checkpoint" ]; then
