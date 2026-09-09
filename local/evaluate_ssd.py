@@ -268,6 +268,8 @@ def evaluate_rows(
 
     num_samples = len(reference_rows)
     num_skipped = sum(skip_reasons.values())
+    num_decode_attempted = num_samples - skip_reasons["missing_prediction"]
+    num_decode_failures = skip_reasons["parse_error"]
     metrics = binary_metrics(all_predictions, all_references) if all_references else None
     stats = find_manifest_stats(manifest_path, corpus, split, num_samples)
     results = {
@@ -293,6 +295,13 @@ def evaluate_rows(
             "num_evaluated": num_samples - num_skipped,
             "num_skipped": num_skipped,
             "coverage_rate": (num_samples - num_skipped) / num_samples if num_samples else 0.0,
+            "num_decode_attempted": num_decode_attempted,
+            "num_decode_failures": num_decode_failures,
+            "decode_failure_rate": (
+                num_decode_failures / num_decode_attempted
+                if num_decode_attempted
+                else 0.0
+            ),
             "skip_reasons": dict(skip_reasons),
             "duplicate_prediction_ids": duplicate_count,
         },
