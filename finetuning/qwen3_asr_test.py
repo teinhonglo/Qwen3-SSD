@@ -14,7 +14,7 @@ from qwen_asr import Qwen3ASRModel
 
 
 _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
-_TARGET_FORMATS = ("ts", "gts", "s", "gs", "tgs")
+_TARGET_FORMATS = ("ts", "gts", "s", "gs", "tgs", "asr_ssd_json")
 
 
 def find_latest_checkpoint(output_dir: str) -> Optional[str]:
@@ -223,6 +223,89 @@ def strip_asr_prefix(text: str) -> str:
     return text.strip()
 
 
+def normalize_indexed_word(word: str) -> str:
+    return re.sub(r"[^A-Za-z0-9']+", "", (word or "")).casefold()
+
+
+def parse_asr_ssd_json(raw_text: str) -> Dict[str, Any]:
+    result = {
+        "pred_transcription": "",
+        "pred_stress": "",
+        "pred_stress_binary": [],
+        "pred_ssd": [],
+        "pred_gender": "",
+        "parse_error": "",
+    }
+    try:
+        parsed = json.loads((raw_text or "").strip())
+    except json.JSONDecodeError:
+        result["parse_error"] = "asr_ssd_json must be exactly one JSON object"
+        return result
+    if not isinstance(parsed, dict):
+        result["parse_error"] = "asr_ssd_json must be a JSON object"
+        return result
+    if set(parsed) != {"asr_text", "ssd"}:
+        result["parse_error"] = (
+            "asr_ssd_json must contain exactly the keys 'asr_text' and 'ssd'"
+        )
+        return result
+
+    transcription = parsed["asr_text"]
+    ssd_items = parsed["ssd"]
+    if not isinstance(transcription, str) or not transcription.strip():
+        result["parse_error"] = "asr_text must be a non-empty string"
+        return result
+    if not isinstance(ssd_items, list):
+        result["parse_error"] = "ssd must be a list"
+        return result
+
+    words = transcription.strip().split()
+    stressed_indices = []
+    seen_indices = set()
+    for item_index, item in enumerate(ssd_items):
+        if not isinstance(item, dict) or len(item) != 1:
+            result["parse_error"] = (
+                f"ssd[{item_index}] must contain exactly one word-to-index pair"
+            )
+            return result
+        word, word_index = next(iter(item.items()))
+        if not isinstance(word, str) or not word.strip():
+            result["parse_error"] = f"ssd[{item_index}] word must be non-empty"
+            return result
+        if type(word_index) is not int:
+            result["parse_error"] = f"ssd[{item_index}] index must be an integer"
+            return result
+        if word_index < 0 or word_index >= len(words):
+            result["parse_error"] = (
+                f"ssd[{item_index}] index {word_index} is outside "
+                f"asr_text with {len(words)} words"
+            )
+            return result
+        if word_index in seen_indices:
+            result["parse_error"] = f"duplicate SSD index: {word_index}"
+            return result
+        if normalize_indexed_word(word) != normalize_indexed_word(words[word_index]):
+            result["parse_error"] = (
+                f"ssd[{item_index}] word {word!r} does not match "
+                f"asr_text word {words[word_index]!r} at index {word_index}"
+            )
+            return result
+        seen_indices.add(word_index)
+        stressed_indices.append(word_index)
+
+    stressed = set(stressed_indices)
+    result["pred_transcription"] = transcription.strip()
+    result["pred_stress"] = " ".join(
+        f"<stress> {word} </stress>" if index in stressed else word
+        for index, word in enumerate(words)
+    )
+    result["pred_stress_binary"] = [
+        int(index in stressed) for index in range(len(words))
+    ]
+    result["pred_ssd"] = ssd_items
+    return result
+
+
 def parse_ssd_output(raw_text: str, target_format: str) -> Dict[str, Any]:
     result = {
         "pred_transcription": "",
@@ -233,6 +316,8 @@ def parse_ssd_output(raw_text: str, target_format: str) -> Dict[str, Any]:
     if target_format not in _TARGET_FORMATS:
         result["parse_error"] = f"unsupported target format: {target_format}"
         return result
+    if target_format == "asr_ssd_json":
+        return parse_asr_ssd_json(raw_text)
     if "<ssd>" not in raw_text:
         result["parse_error"] = "missing <ssd> separator"
         return result
@@ -272,6 +357,44 @@ def parse_ssd_output(raw_text: str, target_format: str) -> Dict[str, Any]:
     if not result["pred_transcription"] and result["pred_stress"]:
         result["pred_transcription"] = remove_stress_tags(result["pred_stress"])
     return result
+
+
+def resolve_row_target_format(
+    row: Dict[str, Any],
+    fallback_target: Optional[str] = None,
+) -> str:
+    row_target = str(row.get("target_format", "") or "").strip()
+    fallback_target = str(fallback_target or "").strip()
+    if row_target and fallback_target and row_target != fallback_target:
+        raise ValueError(
+            f"target_format mismatch: JSONL has {row_target!r}, "
+            f"but --target specifies {fallback_target!r}"
+        )
+    target_format = row_target or fallback_target
+    if not target_format:
+        raise ValueError(
+            "missing target_format in JSONL; use --target only for legacy JSONL"
+        )
+    if target_format not in _TARGET_FORMATS:
+        raise ValueError(f"unsupported target_format: {target_format}")
+    return target_format
+
+
+def validate_target_formats(
+    rows,
+    fallback_target: Optional[str] = None,
+    dataset_name: str = "dataset",
+) -> str:
+    resolved_formats = {
+        resolve_row_target_format(row, fallback_target) for row in rows
+    }
+    if not resolved_formats:
+        raise ValueError(f"{dataset_name} is empty")
+    if len(resolved_formats) != 1:
+        raise ValueError(
+            f"{dataset_name} mixes target formats: {sorted(resolved_formats)}"
+        )
+    return next(iter(resolved_formats))
 
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -386,19 +509,28 @@ def infer_rows(
     total = len(rows)
     for index, row in enumerate(rows, start=1):
         text_id = str(row.get("text_id", row.get("id", f"line{index}")))
-        target_format = target or row.get("target_format", "ts")
         prediction = {
             "id": text_id,
             "text_id": text_id,
             "source_dataset": row.get("source_dataset", ""),
+            "target_format": "",
             "transcription": row.get("transcription", ""),
             "emphasis_indices": row.get("emphasis_indices", []),
             "pred_raw": "",
             "pred_transcription": "",
             "pred_stress": "",
+            "pred_stress_binary": [],
+            "pred_ssd": [],
             "pred_gender": "",
             "parse_error": "",
         }
+        try:
+            target_format = resolve_row_target_format(row, target)
+            prediction["target_format"] = target_format
+        except ValueError as error:
+            prediction["parse_error"] = str(error)
+            output_rows.append(prediction)
+            continue
         audio_path = row.get("audio", "")
         if not audio_path or not os.path.isfile(audio_path):
             prediction["parse_error"] = f"missing audio: {audio_path}"
@@ -437,7 +569,12 @@ def parse_args():
     parser.add_argument("--output_root", default="checkpoints")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--decoding_conf", default="conf/decoding/basic_decoding.json")
-    parser.add_argument("--target", choices=_TARGET_FORMATS, default=None)
+    parser.add_argument(
+        "--target",
+        choices=_TARGET_FORMATS,
+        default=None,
+        help="Legacy fallback for JSONL files without target_format",
+    )
     parser.add_argument("--num_return_sequences", type=int, default=None)
     parser.add_argument("--beam_size", type=int, default=None)
     return parser.parse_args()
@@ -456,6 +593,14 @@ def main():
         resolved_decoding["generation"]["num_return_sequences"],
     )
 
+    rows = load_jsonl(args.input_jsonl)
+    target_format = validate_target_formats(
+        rows,
+        fallback_target=args.target,
+        dataset_name=args.input_jsonl,
+    )
+    print(f"[info] target format: {target_format}")
+
     checkpoint_path = resolve_checkpoint(
         args.exp_dir,
         args.auto_best_checkpoint,
@@ -471,7 +616,6 @@ def main():
     with open(os.path.join(save_dir, "resolved_decoding_config.json"), "w", encoding="utf-8") as file:
         json.dump(resolved_decoding, file, ensure_ascii=False, indent=2)
 
-    rows = load_jsonl(args.input_jsonl)
     output_rows = infer_rows(
         wrapper,
         rows=rows,
@@ -484,6 +628,14 @@ def main():
     with open(output_path, "w", encoding="utf-8") as file:
         for row in output_rows:
             file.write(json.dumps(row, ensure_ascii=False) + "\n")
+    num_decode_failures = sum(bool(row.get("parse_error")) for row in output_rows)
+    decode_failure_rate = (
+        num_decode_failures / len(output_rows) if output_rows else 0.0
+    )
+    print(
+        f"[decode] failures: {num_decode_failures}/{len(output_rows)} "
+        f"({decode_failure_rate:.2%})"
+    )
     print(f"[info] saved: {output_path}")
 
 

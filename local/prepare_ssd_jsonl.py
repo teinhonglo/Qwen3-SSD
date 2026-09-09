@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from corpora import SUPPORTED_CORPORA, compute_stress_binary, load_corpus
 
 
-TARGET_FORMATS = ("ts", "gts", "s", "gs", "tgs")
+TARGET_FORMATS = ("ts", "gts", "s", "gs", "tgs", "asr_ssd_json")
 
 
 def safe_file_stem(value: Any) -> str:
@@ -40,6 +40,7 @@ def build_target(
     stress_pattern: str,
     gender: str,
     target_format: str,
+    emphasis_indices: list[int],
 ) -> str:
     if target_format == "ts":
         payload = json.dumps({"stress_pattern": stress_pattern}, ensure_ascii=False)
@@ -59,6 +60,24 @@ def build_target(
             f"language English<asr_text>{transcription}"
             f"<gender>{gender}<ssd>{stress_pattern}"
         )
+    if target_format == "asr_ssd_json":
+        words = transcription.strip().split()
+        indices = [int(index) for index in emphasis_indices]
+        if len(indices) != len(set(indices)):
+            raise ValueError(f"Duplicate emphasis indices: {indices}")
+        invalid_indices = [
+            index for index in indices if index < 0 or index >= len(words)
+        ]
+        if invalid_indices:
+            raise ValueError(
+                f"Emphasis indices {invalid_indices} are outside the "
+                f"transcription with {len(words)} words"
+            )
+        payload = {
+            "asr_text": transcription,
+            "ssd": [{words[index]: index} for index in indices],
+        }
+        return json.dumps(payload, ensure_ascii=False)
     raise ValueError(f"Unsupported target format: {target_format}")
 
 
@@ -145,6 +164,7 @@ def write_split(
                     stress_pattern,
                     gender,
                     target_format,
+                    emphasis_indices,
                 ),
                 "transcription": transcription,
                 "stress": stress_pattern,
@@ -178,7 +198,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--jsonl-root", type=Path, default=Path("data-json"))
-    parser.add_argument("--prompt-file", type=Path, default=Path("prompt/prompt_ts.txt"))
+    parser.add_argument("--prompt-file", type=Path, default=Path("prompts/prompt_ts.txt"))
     parser.add_argument("--target", choices=TARGET_FORMATS, default="ts")
     parser.add_argument(
         "--corpora",

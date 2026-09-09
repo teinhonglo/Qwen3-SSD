@@ -36,6 +36,7 @@ from finetuning.qwen3_asr_test import (
     infer_rows,
     load_decoding_conf,
     resolve_decoding_conf,
+    validate_target_formats,
 )
 from local.evaluate_ssd import evaluate_rows
 from qwen_asr import Qwen3ASRModel
@@ -326,6 +327,12 @@ class CastFloatInputsTrainer(Trainer):
             f"{metric_key_prefix}_coverage_rate": float(coverage["coverage_rate"]),
             f"{metric_key_prefix}_num_evaluated": float(coverage["num_evaluated"]),
             f"{metric_key_prefix}_num_skipped": float(coverage["num_skipped"]),
+            f"{metric_key_prefix}_num_decode_failures": float(
+                coverage["num_decode_failures"]
+            ),
+            f"{metric_key_prefix}_decode_failure_rate": float(
+                coverage["decode_failure_rate"]
+            ),
             f"{metric_key_prefix}_generation_runtime": time.perf_counter() - started_at,
         }
         if transcription_metrics["wer"] is not None:
@@ -479,7 +486,12 @@ def parse_args():
     p.add_argument("--eval_file", type=str, default="dev.jsonl")
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-finetuning-out")
     p.add_argument("--decoding_conf", type=str, default="conf/decoding/basic_decoding.json")
-    p.add_argument("--target", type=str, default=None)
+    p.add_argument(
+        "--target",
+        type=str,
+        default=None,
+        help="Legacy fallback for JSONL files without target_format",
+    )
     p.add_argument("--manifest", type=str, default="")
 
     # Resume / warm start
@@ -617,6 +629,22 @@ def main():
             "validation": args_cli.eval_file,
         },
     )
+    train_target_format = validate_target_formats(
+        raw_ds["train"],
+        fallback_target=args_cli.target,
+        dataset_name=args_cli.train_file,
+    )
+    eval_target_format = validate_target_formats(
+        raw_ds["validation"],
+        fallback_target=args_cli.target,
+        dataset_name=args_cli.eval_file,
+    )
+    if train_target_format != eval_target_format:
+        raise ValueError(
+            "train/eval target_format mismatch: "
+            f"{train_target_format!r} != {eval_target_format!r}"
+        )
+    print(f"[info] target format: {train_target_format}")
     if eval_generation_metrics:
         eval_columns = set(raw_ds["validation"].column_names)
         missing_columns = {"audio", "prompt", "transcription"} - eval_columns

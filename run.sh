@@ -98,7 +98,6 @@ if [ "$stage" -le 1 ] && [ "$stop_stage" -ge 1 ]; then
                 --train_file "$json_root/tinystress/train.jsonl" \
                 --eval_file "$json_root/tinystress/dev.jsonl" \
                 --decoding_conf "$decoding_conf" \
-                --target "$target" \
                 --manifest "$json_root/manifest.json" \
                 --output_dir "$exp_dir"
         touch "$exp_dir/.done"
@@ -121,7 +120,6 @@ if [ "$stage" -le 2 ] && [ "$stop_stage" -ge 2 ]; then
                 --output_root "$results_root" \
                 --device cuda:0 \
                 --decoding_conf "$decoding_conf" \
-                --target "$target" \
                 > "$results_root/stage2.log"
     done
 fi

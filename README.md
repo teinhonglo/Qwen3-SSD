@@ -9,26 +9,39 @@ adapters for TinyStress, StressTest, StressPresso, Expresso, and EmphAssess.
 
 ```bash
 pip install -e ".[ssd]"
-./run.sh --prompt_file /absolute/path/to/prompt_ts.txt --stage 0 --stop_stage 5
+./run.sh --stage 0 --stop_stage 5
 ```
 
 The default target is `ts` (transcription plus a JSON stress pattern).
 The auxiliary `gts`, `s`, `gs`, and `tgs` formats remain available:
 
 ```bash
-./run.sh --prompt_file /absolute/path/to/prompt_s.txt \
+./run.sh --prompt_file prompts/prompt_s.txt \
   --target s --stage 0 --stop_stage 5
 ```
 
+To train the pure JSON target with zero-based stressed-word indices, use:
+
+```bash
+./run.sh --prompt_file prompts/prompt_asr_ssd_json.txt \
+  --target asr_ssd_json --stage 0 --stop_stage 5
+```
+
+This writes targets such as
+`{"asr_text": "I bought a new record", "ssd": [{"record": 4}]}`.
+
 Stage 0 downloads and validates all configured corpora, creates a seeded
 90/10 TinyStress train/dev split, and writes the common
-`audio`/`prompt`/`text` JSONL schema. Stage 1 finetunes the model.
+`audio`/`prompt`/`text` JSONL schema together with `target_format`. The
+`--target` option controls the Stage 0 `text` serialization. Training-time
+generation evaluation and test inference read their parser format from each
+JSONL row's `target_format`. Stage 1 finetunes the model.
 Stages 2-5 run cross-corpus inference, evaluation with explicit coverage,
 error analysis, and plotting. Use `--test_corpora` to select a subset and
 `--train_conf` or `--decoding_conf` to choose another configuration.
-`--prompt_file` is required and must be an absolute path. Its filename without
-the extension is included in the experiment directory name, for example
-`prompt_ts.txt` produces
+`--prompt_file` defaults to `prompts/prompt_ts.txt` and also accepts another
+relative or absolute path. Its filename without the extension is included in
+the experiment directory name, for example `prompt_ts.txt` produces
 `exp/tinystress/tinystress_qwen3_asr_06b_prompt_ts` with the default config.
 
 <br>
