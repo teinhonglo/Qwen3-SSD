@@ -11,7 +11,7 @@ data_root=data
 json_root=data-json
 test_corpora="tinystress stresstest stresspresso expresso emphassess"
 target=ts
-prompt_file=
+prompt_file=prompts/prompt_ts.txt
 validation_ratio=0.1
 force_download=false
 
@@ -24,17 +24,8 @@ checkpoint=
 inference_mode=best
 force_train=false
 
+. ./path.sh
 . ./local/parse_options.sh
-
-if [ -z "$prompt_file" ]; then
-    echo "[ERROR] --prompt_file is required and must be an absolute path" >&2
-    exit 1
-fi
-
-if [[ "$prompt_file" != /* ]]; then
-    echo "[ERROR] --prompt_file must be an absolute path: $prompt_file" >&2
-    exit 1
-fi
 
 for required_file in "$train_conf" "$decoding_conf" "$prompt_file"; do
     if [ ! -f "$required_file" ]; then
